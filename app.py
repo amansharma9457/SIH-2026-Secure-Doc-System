@@ -2329,4 +2329,6 @@ print("🏛️ SECURE DIGITAL EVIDENCE MANAGEMENT SYSTEM ONLINE (PORT 21006)!")
 print("👉 Open in Chrome: http://127.0.0.1:21006")
 print("=" * 70)
 
-app.run(host="127.0.0.1", port=21006, debug=False)
+import os
+port = int(os.environ.get("PORT", 10000))
+app.run(host="0.0.0.0", port=port, debug=False)
