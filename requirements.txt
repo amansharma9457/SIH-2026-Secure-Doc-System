@@ -1,3 +1,8 @@
 flask
 werkzeug
 gunicorn
+passlib
+bcrypt
+pyjwt
+cryptography
+email-validator
