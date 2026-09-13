@@ -1,8 +1,6 @@
-flask
-werkzeug
-gunicorn
-passlib
-bcrypt
-pyjwt
-cryptography
-email-validator
+Flask>=3.0.0
+Werkzeug>=3.0.0
+cryptography>=42.0.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+PyMuPDF>=1.24.0
