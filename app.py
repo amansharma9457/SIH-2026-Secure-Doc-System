@@ -1,4 +1,5 @@
 
+
 import difflib
 import hashlib
 import json
@@ -16,9 +17,11 @@ import subprocess
 import socket
 import shutil
 import math
+import threading
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from functools import wraps
-from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
+from flask import Flask, Response, jsonify, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -94,16 +97,113 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "0") == "1",
 )
 
+# Security/runtime hardening. These controls are intentionally built with
+# Python/Flask standard capabilities so the application remains portable
+# across Windows, Linux and macOS without requiring a platform-specific agent.
+app.config.update(
+    SESSION_COOKIE_NAME=os.getenv("SESSION_COOKIE_NAME", "sdems_session"),
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))),
+    MAX_FORM_MEMORY_SIZE=2 * 1024 * 1024,
+    MAX_FORM_PARTS=200,
+)
+
+# CSRF token + small in-process login throttle. The CSRF token is only required
+# for authenticated state-changing requests; the normal login POST is exempt so
+# the application remains compatible with the existing login page.
+_login_guard_lock = threading.Lock()
+_login_attempts = defaultdict(deque)
+LOGIN_WINDOW_SECONDS = max(30, int(os.getenv("LOGIN_WINDOW_SECONDS", "120")))
+LOGIN_MAX_ATTEMPTS = max(3, int(os.getenv("LOGIN_MAX_ATTEMPTS", "8")))
+
+BLOCKED_UPLOAD_EXTENSIONS = {
+    ".exe", ".dll", ".so", ".dylib", ".bat", ".cmd", ".com", ".scr",
+    ".ps1", ".vbs", ".js", ".jar", ".msi", ".sh", ".bin"
+}
+
+def _client_ip():
+    # Do not trust X-Forwarded-For by default; a reverse proxy can explicitly
+    # opt in with TRUST_PROXY_HEADERS=1.
+    if os.getenv("TRUST_PROXY_HEADERS", "0") == "1":
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()[:64]
+    return (request.remote_addr or "unknown")[:64]
+
+def _csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+@app.before_request
+def _security_before_request():
+    expected = _csrf_token()
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.path != "/login":
+        # Header is preferred; SameSite cookie is a compatibility fallback for
+        # cached tabs/mobile WebViews. Both values must equal the server session token.
+        supplied = request.headers.get("X-CSRF-Token", "") or request.cookies.get("sdems_csrf", "")
+        if "user" in session and (not expected or not supplied or not secrets.compare_digest(str(supplied), str(expected))):
+            _security_event(session.get("user", {}).get("username", "anonymous"), "CSRF_BLOCK", 70, {"path": request.path, "ip": _client_ip()})
+            return jsonify({"error": "csrf_failed", "message": "Security session expired. Reload the page and try again."}), 403
+
+@app.after_request
+def _security_headers(response):
+    try:
+        token = session.get("csrf_token")
+        if token:
+            response.set_cookie("sdems_csrf", token, httponly=False, secure=app.config.get("SESSION_COOKIE_SECURE", False), samesite="Lax", max_age=3600)
+    except Exception:
+        pass
+    # Preserve the existing inline UI while preventing framing, MIME sniffing,
+    # unsafe object loading and cross-origin policy surprises.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    response.headers.setdefault("Cache-Control", "no-store" if request.path.startswith("/api") or request.path in {"/login", "/dashboard"} else "no-cache")
+    # CSP is compatible with this single-file app's inline UI. It blocks plugins
+    # and remote script/style sources, while allowing local browser capabilities.
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
+        "media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    )
+    if request.is_secure and os.getenv("HSTS_ENABLED", "1") != "0":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 DB_NAME = os.path.join(BASE_DIR, "secure_legal_master_21006.db")
 
+# Problem Statement 26190 document classes. These are metadata labels only;
+# the original file bytes and cryptographic hash remain authoritative.
+DOCUMENT_TYPES = [
+    "FIR / Police Report",
+    "Investigation Record",
+    "Witness Statement",
+    "Charge Sheet",
+    "Court Filing",
+    "Evidence Record",
+    "Forensic Report",
+    "Legal Notice",
+    "Judgment",
+    "Other",
+]
+
 
 def get_db():
-    conn = sqlite3.connect(DB_NAME, timeout=10)
+    # One short-lived connection per operation/request keeps the app portable
+    # and avoids sharing SQLite connections across threads/processes.
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 10000")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -161,6 +261,11 @@ def init_db():
         )
     """)
 
+    # Demo/competition accounts shown on the login page.
+    # Keep these credentials synchronized with the displayed credentials even
+    # when an older SQLite database already exists. Previously, the code only
+    # inserted missing users, so a stale database could contain an old hash and
+    # make the visible credentials fail.
     system_users = [
         ("admin", "admin123", "Court Administrator"),
         ("singham", "singham123", "Police Inspector"),
@@ -168,7 +273,13 @@ def init_db():
     ]
     for u, p, r in system_users:
         cursor.execute("SELECT id FROM users WHERE username = ?", (u,))
-        if not cursor.fetchone():
+        existing = cursor.fetchone()
+        if existing:
+            cursor.execute(
+                "UPDATE users SET password_hash = ?, role = ? WHERE username = ?",
+                (generate_password_hash(p), r, u)
+            )
+        else:
             cursor.execute(
                 "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
                 (u, generate_password_hash(p), r)
@@ -461,6 +572,40 @@ def init_db():
     """)
     # Backward-compatible schema extension for databases created by earlier builds.
     existing_cols={r[1] for r in cursor.execute("PRAGMA table_info(documents)").fetchall()}
+    if "title" not in existing_cols:
+        cursor.execute("ALTER TABLE documents ADD COLUMN title TEXT")
+    if "doc_type" not in existing_cols:
+        cursor.execute("ALTER TABLE documents ADD COLUMN doc_type TEXT DEFAULT 'Evidence Record'")
+    if "version" not in existing_cols:
+        cursor.execute("ALTER TABLE documents ADD COLUMN version INTEGER DEFAULT 1")
+    if "previous_version_id" not in existing_cols:
+        cursor.execute("ALTER TABLE documents ADD COLUMN previous_version_id INTEGER")
+    if "enc_nonce" not in existing_cols:
+        # NULL enc_nonce = legacy plaintext record (pre-encryption-at-rest).
+        cursor.execute("ALTER TABLE documents ADD COLUMN enc_nonce TEXT")
+
+    # Permissioned local blockchain ledger. It stores document/event anchors,
+    # not the sensitive document bytes. Every block is chained by SHA-256.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS blockchain_blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            block_index INTEGER NOT NULL UNIQUE,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            doc_id INTEGER,
+            case_no TEXT,
+            document_hash TEXT,
+            payload_json TEXT NOT NULL,
+            previous_hash TEXT NOT NULL,
+            block_hash TEXT NOT NULL UNIQUE,
+            node_id TEXT NOT NULL
+        )
+    """)
+
+    # Backfill useful metadata for documents created by older versions.
+    cursor.execute("UPDATE documents SET title=COALESCE(NULLIF(title,''), original_filename) WHERE title IS NULL OR title=''")
+    cursor.execute("UPDATE documents SET doc_type=COALESCE(NULLIF(doc_type,''),'Evidence Record') WHERE doc_type IS NULL OR doc_type=''")
+    cursor.execute("UPDATE documents SET version=COALESCE(version,1) WHERE version IS NULL")
     if "storage_region" not in existing_cols:
         cursor.execute("ALTER TABLE documents ADD COLUMN storage_region TEXT DEFAULT 'IN'")
     if "retention_until" not in existing_cols:
@@ -482,6 +627,9 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_redteam_runs_agent ON redteam_runs(agent)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_verification_hash ON media_verification(sha256)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ai_knowledge_status ON ai_knowledge_provenance(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_blockchain_doc ON blockchain_blocks(doc_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_blockchain_case ON blockchain_blocks(case_no)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_blockchain_index ON blockchain_blocks(block_index DESC)")
 
     # Performance-oriented SQLite settings. WAL improves concurrent reads while
     # NORMAL synchronous mode keeps good durability without excessive fsync calls.
@@ -505,6 +653,82 @@ def init_db():
 
 
 init_db()
+
+
+def init_26190_alignment_schema():
+    """Add the core 26190 DMS capabilities without replacing legacy tables.
+
+    These tables are additive and keep existing records/features intact:
+    - document_acl: explicit stakeholder authorization
+    - document_versions: immutable version lineage
+    - collaboration_messages: authorized case collaboration
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS document_acl (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER NOT NULL,
+            grantee_username TEXT,
+            grantee_role TEXT,
+            permission TEXT NOT NULL DEFAULT 'READ',
+            granted_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(doc_id, grantee_username, grantee_role, permission)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS document_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_doc_id INTEGER NOT NULL,
+            parent_doc_id INTEGER NOT NULL,
+            version_doc_id INTEGER UNIQUE NOT NULL,
+            version_no INTEGER NOT NULL,
+            previous_hash TEXT NOT NULL,
+            current_hash TEXT NOT NULL,
+            change_note TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            blockchain_block_index INTEGER
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS collaboration_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER NOT NULL,
+            case_no TEXT NOT NULL,
+            author TEXT NOT NULL,
+            author_role TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            edited INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    # Migration safety net: if document_versions already existed from an older
+    # run (before root_doc_id/parent_doc_id were added), add the missing
+    # columns instead of dropping the table, so existing rows are preserved.
+    cur.execute("PRAGMA table_info(document_versions)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if "root_doc_id" not in existing_cols:
+        cur.execute("ALTER TABLE document_versions ADD COLUMN root_doc_id INTEGER NOT NULL DEFAULT 0")
+    if "parent_doc_id" not in existing_cols:
+        cur.execute("ALTER TABLE document_versions ADD COLUMN parent_doc_id INTEGER NOT NULL DEFAULT 0")
+    if "blockchain_block_index" not in existing_cols:
+        cur.execute("ALTER TABLE document_versions ADD COLUMN blockchain_block_index INTEGER")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_acl_doc ON document_acl(doc_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_acl_user ON document_acl(grantee_username)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_acl_role ON document_acl(grantee_role)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_versions_root ON document_versions(root_doc_id, version_no)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_versions_parent ON document_versions(parent_doc_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_collab_doc ON collaboration_messages(doc_id, id DESC)")
+    conn.commit()
+    conn.close()
+
+
+init_26190_alignment_schema()
 
 
 def login_required(f):
@@ -547,6 +771,95 @@ def _b64(data):
 
 def _token_hash(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# ---------------- PERMISSIONED BLOCKCHAIN / IMMUTABLE EVIDENCE ANCHOR ---------------- #
+def _block_payload(previous_hash, event_type, doc_id, case_no, document_hash, payload, timestamp, node_id):
+    body = {
+        "previous_hash": previous_hash,
+        "event_type": event_type,
+        "doc_id": doc_id,
+        "case_no": case_no,
+        "document_hash": document_hash,
+        "payload": payload or {},
+        "timestamp": timestamp,
+        "node_id": node_id,
+    }
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+_blockchain_lock = threading.Lock()
+
+
+def add_blockchain_block(event_type, doc_id=None, case_no=None, document_hash=None, payload=None):
+    """Append a tamper-evident blockchain block. Only hashes/metadata are anchored;
+    sensitive evidence bytes stay in the vault. This is a self-contained permissioned
+    ledger suitable for a prototype/demo and can later be replaced by a consortium chain.
+
+    Wrapped in a process-wide lock + small retry loop: without this, two concurrent
+    requests (e.g. two officers uploading at the same time) can both read the same
+    "last block index", then both try to insert the same next index, causing a
+    UNIQUE constraint failure / "database is locked" 500 error under real multi-user
+    load. The lock serializes chain writes so the ledger stays consistent."""
+    timestamp = _now()
+    node_id = socket.gethostname()
+    safe_payload = payload if isinstance(payload, dict) else {"value": str(payload)}
+    last_error = None
+    with _blockchain_lock:
+        for attempt in range(6):
+            conn = get_db()
+            try:
+                last = conn.execute("SELECT block_index, block_hash FROM blockchain_blocks ORDER BY block_index DESC LIMIT 1").fetchone()
+                block_index = int(last["block_index"]) + 1 if last else 0
+                previous_hash = last["block_hash"] if last else ("0" * 64)
+                raw = _block_payload(previous_hash, event_type, doc_id, case_no, document_hash, safe_payload, timestamp, node_id)
+                block_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                conn.execute("""INSERT INTO blockchain_blocks
+                    (block_index,timestamp,event_type,doc_id,case_no,document_hash,payload_json,previous_hash,block_hash,node_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (block_index,timestamp,event_type,doc_id,case_no,document_hash,
+                     json.dumps(safe_payload, sort_keys=True, ensure_ascii=False), previous_hash, block_hash, node_id))
+                conn.commit()
+                return {"block_index":block_index,"block_hash":block_hash,"previous_hash":previous_hash,"timestamp":timestamp,"node_id":node_id}
+            except (sqlite3.IntegrityError, sqlite3.OperationalError) as exc:
+                conn.rollback()
+                last_error = exc
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            finally:
+                conn.close()
+    # Extremely unlikely after 6 retries under a process-wide lock, but never let this
+    # crash the caller's request with a raw traceback — surface a clean, catchable error.
+    raise RuntimeError(f"Could not append blockchain block after retries: {last_error}")
+
+
+def verify_blockchain():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM blockchain_blocks ORDER BY block_index ASC").fetchall()
+    conn.close()
+    previous = "0" * 64
+    checked = 0
+    broken_at = None
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except Exception:
+            payload = {"_invalid_json": True}
+        raw = _block_payload(previous, row["event_type"], row["doc_id"], row["case_no"], row["document_hash"], payload, row["timestamp"], row["node_id"])
+        expected = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if row["previous_hash"] != previous or row["block_hash"] != expected:
+            broken_at = row["block_index"]
+            break
+        previous = row["block_hash"]
+        checked += 1
+    return {"valid": broken_at is None, "blocks_checked": checked, "total_blocks": len(rows), "broken_at": broken_at, "latest_hash": previous if rows else "0"*64}
+
+
+def latest_blockchain_blocks(limit=12):
+    conn=get_db()
+    rows=[dict(r) for r in conn.execute("SELECT * FROM blockchain_blocks ORDER BY block_index DESC LIMIT ?",(max(1,min(int(limit),50)),)).fetchall()]
+    conn.close()
+    return rows
 
 
 def _security_event(username, event_type, risk_score, details):
@@ -924,6 +1237,70 @@ def verify_media_authenticity(path, filename, username):
         (verification_id,secure_filename(filename) or "media",media_type,sha,mime,json.dumps(probe,ensure_ascii=False),json.dumps(signals,ensure_ascii=False),verdict,confidence,username,_now())); conn.commit(); conn.close()
     return {"verification_id":verification_id,"filename":filename,"media_type":media_type,"sha256":sha,"mime_type":mime,"signals":signals,"verdict":verdict,"confidence":confidence,"deepfake_ml_detector":False,"note":"Container/hash verification cannot prove that a recording is human-generated. A trained audio/video deepfake detector and provenance/attestation are required for a stronger authenticity verdict."}
 
+# ---------------- AT-REST DOCUMENT ENCRYPTION (AES-256-GCM) ---------------- #
+# Every evidence file is encrypted before it touches disk. The master key is
+# derived (HKDF-SHA256) from the same persisted app secret used for sessions,
+# so no extra key file has to be managed separately for the demo/prototype.
+# In a production deployment this should be swapped for a KMS/HSM-backed key.
+def _file_master_key():
+    if not CRYPTO_AVAILABLE:
+        raise RuntimeError("cryptography package is required for at-rest document encryption")
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=None,
+        info=b"SDEMS-DOCUMENT-ENCRYPTION-V1"
+    ).derive(app.secret_key.encode("utf-8"))
+
+
+def encrypt_document_bytes(raw: bytes, aad: str):
+    """Returns (nonce_b64, ciphertext). aad binds the ciphertext to the doc_uuid
+    so a ciphertext file can't be silently swapped onto a different record."""
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(_file_master_key()).encrypt(nonce, raw, aad.encode("utf-8"))
+    return base64.b64encode(nonce).decode("ascii"), ciphertext
+
+
+def decrypt_document_bytes(nonce_b64: str, ciphertext: bytes, aad: str) -> bytes:
+    nonce = base64.b64decode(nonce_b64)
+    return AESGCM(_file_master_key()).decrypt(nonce, ciphertext, aad.encode("utf-8"))
+
+
+def read_document_plaintext(doc_row) -> bytes:
+    """Reads a document's stored bytes and transparently decrypts them.
+    Falls back to raw bytes for legacy rows created before encryption-at-rest
+    was enabled (enc_nonce is NULL), so old evidence stays readable."""
+    path = os.path.join(UPLOAD_FOLDER, doc_row["stored_filename"])
+    with open(path, "rb") as f:
+        data = f.read()
+    nonce_b64 = None
+    try:
+        nonce_b64 = doc_row["enc_nonce"]
+    except (IndexError, KeyError):
+        nonce_b64 = None
+    if nonce_b64:
+        return decrypt_document_bytes(nonce_b64, data, doc_row["doc_uuid"])
+    return data
+
+
+def _atomic_write_ciphertext(ciphertext: bytes, destination: str):
+    """Atomically writes already-encrypted bytes so a partial/crashed write
+    never becomes the registered evidence file."""
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, exist_ok=True)
+    temp_path = os.path.join(parent, ".upload_" + secrets.token_hex(16) + ".tmp")
+    try:
+        with open(temp_path, "wb") as out:
+            out.write(ciphertext)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp_path, destination)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
 # ---------------- EPHEMERAL KEYS / HONEY TOKENS / HARDWARE TOKEN BINDING ---------------- #
 def _key_wrap_key():
     return hashlib.sha256((app.secret_key + "|SD-KEY-WRAP-V1").encode("utf-8")).digest()
@@ -1175,7 +1552,7 @@ def sign_verifiable_credential(payload):
 def ai_chat_reasoning(user_query, current_doc_text="", original_doc_text="", is_tampered=False, diff_summary=None):
     agent_state=ai_agent_mode("LawGPT")
     if agent_state.get("mode")=="RETIRED":
-        return "🛑 **LawGPT Retired:** This agent has been retired by the security control plane. No action will be executed. Contact an administrator for the approved replacement agent."
+        return "🛑 **Case Intelligence Retired:** This agent has been retired by the security control plane. No action will be executed. Contact an administrator for the approved replacement agent."
     q = user_query.lower()
     raw_context = f"{original_doc_text}\n{current_doc_text}".strip()
     poison = poisoning_guard(raw_context) if raw_context else {"poisoned":False,"markers":[],"trusted_source":True,"action":"ALLOW_AS_DATA"}
@@ -1191,24 +1568,24 @@ def ai_chat_reasoning(user_query, current_doc_text="", original_doc_text="", is_
         combined_context=raw_context
 
     if not combined_context:
-        return "⚠️ **LawGPT Alert:** No active case document is loaded in your workspace. Please ingest or audit an evidence record first so I can analyze it."
+        return "⚠️ **Case Intelligence Alert:** No active case document is loaded in your workspace. Please ingest or audit an evidence record first so I can analyze it."
 
     if any(k in q for k in ["role", "accused", "suspect", "section", "charges", "chargesheet", "allegation"]):
         lines = [l.strip() for l in combined_context.splitlines() if l.strip()]
         relevant = [l for l in lines if re.search(r'accused|role|charge|suspect|allegation|victim|name|offense|bns|ipc', l, re.I)]
         if relevant:
-            ans = "👤 **LawGPT Accused & Allegation Analysis:**\n"
+            ans = "👤 **Case Intelligence Accused & Allegation Analysis:**\n"
             for r in relevant[:5]:
                 ans += f"• {r}\n"
             ans += "\n⚖️ **Judicial Note:** The accused is subject to inquiry under corresponding penal statutes. Verify matching identity in the physical locker log."
             return ans
-        return "👤 **LawGPT Entity Scan:** No explicit 'Accused' metadata label identified in current document text lines. Review the full text viewer for deeper context."
+        return "👤 **Case Intelligence Entity Scan:** No explicit 'Accused' metadata label identified in current document text lines. Review the full text viewer for deeper context."
 
     if any(k in q for k in ["gap", "tamper", "changed", "difference", "forgery", "modified", "discrepancy", "alter"]):
         if not is_tampered:
             return "✅ **Forensic Integrity Verified:** Zero legal gaps or discrepancies detected. The uploaded document perfectly matches the registered SHA-256 master hash in the immutable vault."
         
-        ans = "🚨 **LawGPT Forensic Discrepancy & Legal Gap Breakdown:**\n"
+        ans = "🚨 **Case Intelligence Forensic Discrepancy & Legal Gap Breakdown:**\n"
         if diff_summary:
             for d in diff_summary:
                 if d.get("type") == "removed":
@@ -1224,7 +1601,7 @@ def ai_chat_reasoning(user_query, current_doc_text="", original_doc_text="", is_
         time_matches = re.findall(r'(?:\b\d{1,2}:\d{2}(?:\s?[ap]m)?\b|\b\d{1,2}\s+(?:am|pm)\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b|timestamp|time|ist|hours)', combined_context, re.I)
         witness_lines = [l.strip() for l in combined_context.splitlines() if re.search(r'witness|statement|time|stated|saw|present|spot|police| FIR ', l, re.I)]
         
-        ans = "👁️ **LawGPT Witness Statement & Temporal Correlation:**\n"
+        ans = "👁️ **Case Intelligence Witness Statement & Temporal Correlation:**\n"
         if witness_lines:
             for wl in witness_lines[:4]:
                 ans += f"• {wl}\n"
@@ -1237,7 +1614,7 @@ def ai_chat_reasoning(user_query, current_doc_text="", original_doc_text="", is_
     if any(k in q for k in ["summary", "summarize", "brief", "details", "overview"]):
         lines = [l.strip() for l in (current_doc_text or original_doc_text).splitlines() if l.strip()]
         brief = lines[:6]
-        ans = "📜 **LawGPT Case Executive Summary:**\n"
+        ans = "📜 **Case Intelligence Case Executive Summary:**\n"
         for b in brief:
             ans += f"• {b}\n"
         if is_tampered:
@@ -1249,7 +1626,7 @@ def ai_chat_reasoning(user_query, current_doc_text="", original_doc_text="", is_
             return "⚖️ **Electronic Record Integrity Status: VERIFIED**\nUnbroken chain-of-custody verified via hardware attestation and SHA-256 digest matching. A certificate report can be generated from the registered record; legal admissibility must be determined by the appropriate authority."
         return "❌ **Electronic Record Integrity Status: MISMATCH**\nCryptographic hash mismatch identified. The file does not match the registered baseline hash."
 
-    return f"🤖 **LawGPT AI Legal Assistant:**\nI have scanned the active docket. Relevant context excerpt:\n> {combined_context[:250]}...\n\nAsk specific case-analysis questions such as:\n• *'What is the accused role in the charge sheet?'*\n• *'What are the main differences between the original and modified files?'*\n• *'What time is mentioned in the witness statement?'*"
+    return f"🤖 **Case Intelligence AI Legal Assistant:**\nI have scanned the active docket. Relevant context excerpt:\n> {combined_context[:250]}...\n\nAsk specific case-analysis questions such as:\n• *'What is the accused role in the charge sheet?'*\n• *'What are the main differences between the original and modified files?'*\n• *'What time is mentioned in the witness statement?'*"
 
 
 # ---------------- FRONTEND TEMPLATES ---------------- #
@@ -1408,7 +1785,7 @@ LOGIN_PAGE = """
         <div class="login-card">
             <div style="text-align: center; font-size: 32px; margin-bottom: 10px;">⚖️</div>
             <h1 class="heading">SECURE DIGITAL EVIDENCE MANAGEMENT SYSTEM</h1>
-            <p class="subheading">Command Center & LawGPT AI Suite</p>
+            <p class="subheading">Evidence Command Centre & Case Intelligence</p>
             {% if error %}<div class="error-banner">{{ error }}</div>{% endif %}
             <form method="POST" action="/login">
                 <div class="input-group">
@@ -1464,7 +1841,94 @@ LOGIN_PAGE = """
         window.loadEnclave = async function(){try{const d=await safeFetchJson('/api/security/confidential-computing'); const el=document.getElementById('enclaveStatus'); if(el) el.textContent=`${d.status} — provider: ${d.provider_config}${d.warning?' — '+d.warning:''}`;}catch(e){}};
         window.loadLockdown = async function(){try{const d=await safeFetchJson('/api/security/lockdown'); const el=document.getElementById('lockdownStatus'); if(el) el.textContent=d.lockdown?'🚨 LOCKDOWN ACTIVE: '+d.reason:'✅ NORMAL OPERATING MODE';}catch(e){}};
         window.toggleLockdown = async function(active){const reason=document.getElementById('lockReason')?.value||'Emergency security lockdown'; const action=active?'activate':'deactivate'; try{const d=await safeFetchJson('/api/security/lockdown',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,reason})}); const el=document.getElementById('lockOut'); if(el) el.textContent=JSON.stringify(d,null,2); window.loadLockdown();}catch(e){const el=document.getElementById('lockOut'); if(el) el.textContent=e.message;}};
+        // Advanced Security Control Plane: expose every action on window because
+        // the dashboard intentionally uses inline button handlers. Keeping these
+        // bindings here prevents one failed optional module from making the rest
+        // of the security console appear dead.
+        const advOut = (id, value) => { const el=document.getElementById(id); if(el) el.textContent=value; };
+        const advErr = (id, err) => advOut(id, 'ERROR: ' + (err?.message || String(err || 'Request failed')));
+        window.makeProof = async function(){
+            try {
+                const claim=document.getElementById('zkClaim')?.value.trim();
+                const secret=document.getElementById('zkSecret')?.value;
+                if(!claim || !secret){ advOut('zkOut','Enter both a claim and verifier secret.'); return; }
+                const d=await safeFetchJson('/api/zkp/prove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim,secret})});
+                advOut('zkOut',JSON.stringify(d.proof || d,null,2));
+            } catch(e){ advErr('zkOut',e); }
+        };
+        window.grantAccess = async function(){
+            try {
+                const docId=Number(document.getElementById('accessDocId')?.value);
+                const minutes=Number(document.getElementById('accessMinutes')?.value || 30);
+                if(!docId){ advOut('accessOut','Select/enter a valid Document ID.'); return; }
+                const d=await safeFetchJson('/api/access/grant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:docId,minutes})});
+                advOut('accessOut',JSON.stringify(d,null,2));
+            } catch(e){ advErr('accessOut',e); }
+        };
+        window.signApproval = async function(){
+            try {
+                const docId=Number(document.getElementById('approvalDocId')?.value);
+                if(!docId){ advOut('approvalOut','Select/enter a valid Document ID.'); return; }
+                const d=await safeFetchJson('/api/approvals/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:docId,decision:'APPROVE'})});
+                advOut('approvalOut',JSON.stringify(d,null,2));
+            } catch(e){ advErr('approvalOut',e); }
+        };
+        window.issueVC = async function(){
+            try {
+                const docId=Number(document.getElementById('vcDocId')?.value);
+                if(!docId){ advOut('vcOut','Select/enter a valid Document ID.'); return; }
+                const d=await safeFetchJson('/api/vc/issue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:docId})});
+                advOut('vcOut',JSON.stringify(d,null,2));
+            } catch(e){ advErr('vcOut',e); }
+        };
+        window.offlineProof = async function(){
+            try {
+                const docId=Number(document.getElementById('offlineDocId')?.value);
+                if(!docId){ advOut('offlineOut','Select/enter a valid Document ID.'); return; }
+                const d=await safeFetchJson('/api/offline/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:docId})});
+                advOut('offlineOut',JSON.stringify(d,null,2));
+            } catch(e){ advErr('offlineOut',e); }
+        };
+        window.crossChainProof = async function(){
+            try {
+                const proof=document.getElementById('chainProof')?.value.trim();
+                if(!proof){ advOut('chainOut','Paste a proof bundle first.'); return; }
+                const d=await safeFetchJson('/api/crosschain/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proof})});
+                advOut('chainOut',JSON.stringify(d,null,2));
+            } catch(e){ advErr('chainOut',e); }
+        };
+        window.loadPQC = async function(){
+            try { const d=await safeFetchJson('/api/security/pqc'); advOut('pqcStatus',`${d.mode || 'Provider unavailable'}${d.warning ? ' — '+d.warning : ' — ready'}`); }
+            catch(e){ advErr('pqcStatus',e); }
+        };
+        window.loadSecurityEvents = async function(){
+            try { const d=await safeFetchJson('/api/security/events'); advOut('riskOut',JSON.stringify(d,null,2)); }
+            catch(e){ advErr('riskOut',e); }
+        };
+        window.addEventListener('load', function(){
+            // These are independent read-only probes; failure of one must not stop the others.
+            Promise.allSettled([window.loadPQC(), window.loadEnclave(), window.loadLockdown()]);
+        });
         window.addEventListener('load', function(){ window.loadEnclave(); window.loadLockdown(); });
+        // ---------------- RELIABLE UI BOOTSTRAP ---------------- //
+        // Keep controls usable even when one optional module fails to initialize.
+        window.addEventListener('error', function(event) {
+            console.error('SD-Evidence UI error:', event.error || event.message);
+        });
+        window.addEventListener('unhandledrejection', function(event) {
+            console.error('SD-Evidence async error:', event.reason);
+        });
+        document.addEventListener('DOMContentLoaded', function() {
+            const themeButtons = document.querySelectorAll('#themeToggleBtn');
+            themeButtons.forEach(btn => {
+                btn.type = 'button';
+                btn.onclick = function(ev) { ev.preventDefault(); window.toggleTheme(); };
+            });
+            // Repair stale cached markup without forcing the user to clear the browser cache.
+            const tokenMeta = document.querySelector('meta[name="csrf-token"]');
+            if (tokenMeta && !tokenMeta.content) tokenMeta.content = PAGE_CSRF_TOKEN || '';
+        });
+
     </script>
 </body>
 </html>
@@ -1476,7 +1940,8 @@ DASHBOARD_PAGE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Secure Digital Evidence Management System | Section 65B Certified</title>
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <title>Secure Digital Evidence Management System | Evidence Integrity Platform</title>
     <style>
         :root {
             --bg-body: #030712;
@@ -1496,9 +1961,9 @@ DASHBOARD_PAGE = """
             --overlay-color: rgba(0, 0, 0, 0.75);
             --scrollbar-track: #030712;
             --scrollbar-thumb: #1e293b;
-            --success-text: var(--success-text);
-            --danger-text: var(--danger-text);
-            --info-text: var(--info-text);
+            --success-text: #34d399;
+            --danger-text: #f87171;
+            --info-text: #60a5fa;
             color-scheme: dark;
         }
         body.light-theme {
@@ -1765,6 +2230,13 @@ DASHBOARD_PAGE = """
 
         .tab-content { display: none; }
         .tab-content.active { display: block; }
+
+        .feature-page-header { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:18px 20px; margin-bottom:18px; background:linear-gradient(135deg, var(--card-bg), var(--card-inner)); border:1px solid var(--border-color); border-radius:12px; box-shadow:0 4px 18px rgba(0,0,0,.16); }
+        .feature-page-header h2 { margin:4px 0 3px; font-size:20px; color:var(--text-main); letter-spacing:.2px; }
+        .feature-page-header p { margin:0; color:var(--text-muted); font-size:11px; }
+        .feature-kicker { color:var(--emerald-secure); font-size:9px; font-weight:900; letter-spacing:1px; }
+        .feature-status { flex:0 0 auto; padding:7px 10px; border-radius:999px; border:1px solid rgba(16,185,129,.35); color:var(--success-text); background:rgba(16,185,129,.08); font-size:9px; font-weight:900; letter-spacing:.7px; }
+        @media (max-width: 720px) { .feature-page-header { padding:14px; align-items:flex-start; } .feature-page-header h2 { font-size:16px; } .feature-status { font-size:8px; } }
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 
         .card {
@@ -1908,6 +2380,8 @@ DASHBOARD_PAGE = """
         }
         .header-orig { background: #064e3b; color: var(--success-text); }
         .header-mod { background: #7f1d1d; color: var(--danger-text); }
+        .tamper-one-line { white-space: nowrap !important; overflow-x: auto; overflow-y: hidden; display: block; width: 100%; scrollbar-width: thin; }
+        .tamper-one-line::-webkit-scrollbar { height: 5px; }
         .summary-card {
             background: var(--card-inner);
             border: 1px solid var(--border-color);
@@ -2004,6 +2478,69 @@ DASHBOARD_PAGE = """
             color: var(--text-muted);
             line-height: 1.4;
         }
+
+        /* ---------- RESPONSIVE WORKSPACE / PHONE SAFE LAYOUT ---------- */
+        html { min-width: 0; overflow-x: hidden; }
+        body { width: 100%; max-width: 100vw; overflow-x: hidden; }
+        .top-nav, .live-feed-bar, .content-area { min-width: 0; }
+        .top-nav { flex-wrap: wrap; row-gap: 8px; }
+        .left-menu-btn-group { min-width: 0; flex: 1 1 420px; }
+        .left-menu-btn-group > div:last-child { min-width: 0; }
+        .left-menu-btn-group > div:last-child span:first-child { overflow-wrap: anywhere; }
+        .top-nav > div:last-child { flex-wrap: wrap; justify-content: flex-end; min-width: 0; }
+        .live-feed-bar { flex-wrap: wrap; }
+        .ticker-text { min-width: 0; flex: 1 1 240px; overflow-wrap: anywhere; }
+        .content-area { padding: 18px clamp(12px, 3vw, 28px) 40px; }
+        .tab-content { width: 100%; min-width: 0; scroll-margin-top: 76px; }
+        .feature-page-header { min-width: 0; flex-wrap: wrap; }
+        .feature-page-header > div { min-width: 0; }
+        .feature-page-header h2, .feature-page-header p { overflow-wrap: anywhere; }
+        .quick-hero-grid, .kpi-grid, .grid-2, .side-by-side { min-width: 0; }
+        .hero-action-card, .kpi-card, .card { min-width: 0; }
+        .card-header { gap: 10px; flex-wrap: wrap; }
+        .card-header span:first-child { min-width: 0; overflow-wrap: anywhere; }
+        input, select, textarea, button { max-width: 100%; }
+        pre { max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+        .doc-view-box { max-width: 100%; overflow: auto; }
+        .side-by-side > *, .grid-2 > * { min-width: 0; }
+        .modal-card { width: min(440px, calc(100vw - 24px)); max-height: calc(100vh - 24px); overflow: auto; }
+        .slide-drawer { width: min(410px, 92vw); left: calc(-1 * min(420px, 94vw)); max-width: 100vw; }
+        .slide-drawer.open { left: 0; }
+
+        @media (max-width: 1050px) {
+            .quick-hero-grid { grid-template-columns: 1fr; }
+            .grid-2, .side-by-side { grid-template-columns: 1fr; }
+            .top-nav { padding: 10px 14px; }
+            .live-feed-bar { padding: 8px 14px; }
+        }
+        @media (max-width: 720px) {
+            .content-area { padding: 12px 10px 30px; }
+            .top-nav { align-items: flex-start; }
+            .left-menu-btn-group { flex-basis: 100%; }
+            .top-nav > div:last-child { width: 100%; justify-content: flex-start; gap: 7px; }
+            .role-highlight-badge { order: 1; }
+            .btn-open-copilot { order: 2; }
+            .theme-toggle-btn { order: 3; }
+            .logout-btn { order: 4; }
+            .feature-page-header { padding: 12px; }
+            .card { padding: 14px; border-radius: 9px; }
+            .card-header { font-size: 11px; }
+            th, td { padding: 8px; }
+            .table-wrap { overflow-x: auto; max-width: 100%; }
+            table { min-width: 560px; }
+            .sidebar-chat-input-box { flex-wrap: nowrap; }
+            .sidebar-chat-input-box input { min-width: 0; }
+        }
+        @media (max-width: 480px) {
+            .slide-drawer { width: 94vw; left: -96vw; }
+            .drawer-header { padding: 12px; }
+            .nav-item { font-size: 11px; padding: 8px 9px; }
+            .hero-action-card { padding: 13px; }
+            .kpi-grid { grid-template-columns: 1fr 1fr; }
+            .kpi-card { padding: 10px; }
+            .kpi-data h3 { font-size: 18px; }
+            .live-feed-bar { font-size: 10px; gap: 7px; }
+        }
     </style>
 </head>
 <body>
@@ -2036,7 +2573,7 @@ DASHBOARD_PAGE = """
     <!-- Drawer Overlay -->
     <div id="drawerOverlay" class="drawer-overlay" onclick="closeDrawer()"></div>
 
-    <!-- Sliding Sidebar Drawer with LawGPT -->
+    <!-- Sliding Sidebar Drawer with Case Intelligence -->
     <div id="slideDrawer" class="slide-drawer">
         <div class="drawer-header">
             <div class="brand-wrap">
@@ -2058,18 +2595,18 @@ DASHBOARD_PAGE = """
             <li class="nav-item" onclick="switchDrawerTab('heatmap', this)">🗺️ 6. Vault Shelf Heatmap</li>
         </ul>
 
-        <!-- LawGPT Chatbot inside Sidebar -->
+        <!-- Case Intelligence Chatbot inside Sidebar -->
         <div class="sidebar-chat-wrapper">
             <div class="sidebar-chat-header">
                 <div>
-                    <b style="font-size: 11px; color: var(--emerald-secure);">🤖 LawGPT AI Cross-Examiner</b>
+                    <b style="font-size: 11px; color: var(--emerald-secure);">🤖 Case Intelligence Assistant</b>
                     <span style="font-size: 9px; color: var(--text-muted); display: block;">Case Forensic Assistant</span>
                 </div>
                 <span style="font-size: 9px; background: rgba(16,185,129,0.2); color: var(--success-text); padding: 2px 5px; border-radius: 4px;">LIVE</span>
             </div>
             
             <div id="chatMessages" class="sidebar-chat-messages">
-                <div class="msg msg-ai">Hello. I am your <b>LawGPT Sidebar Copilot</b>. Upload or audit a case document, then ask me:
+                <div class="msg msg-ai">Hello. I am your <b>Case Intelligence Sidebar Copilot</b>. Upload or audit a case document, then ask me:
 • *"What is the accused role in the charge sheet?"*
 • *"What are the main differences between the original and modified files?"*
 • *"What time is mentioned in the witness statement?"*</div>
@@ -2102,7 +2639,7 @@ DASHBOARD_PAGE = """
         </div>
         <div style="display: flex; align-items: center; gap: 12px;">
             <span class="role-highlight-badge">{{ session['user']['role'] }} Priority View</span>
-            <button class="btn-open-copilot" onclick="openDrawer()">🤖 Open AI Copilot</button>
+            <button class="btn-open-copilot" onclick="openDrawer()">🤖 Open Case Assistant</button>
             <button class="theme-toggle-btn" id="themeToggleBtn" onclick="toggleTheme()" title="Switch Light / Dark Theme">🌙</button>
             <span style="font-size: 11px; color: var(--text-muted);"><b>{{ session['user']['username'] }}</b></span>
             <a href="/logout" class="logout-btn">Sign Out</a>
@@ -2119,6 +2656,9 @@ DASHBOARD_PAGE = """
     <!-- Main Workspace Container -->
     <div class="content-area">
         
+        <!-- TAB 1: MASTER VAULT & CASE EXPLORER -->
+        <div id="view-vault" class="tab-content active">
+            <div class="feature-page-header"><div><span class="feature-kicker">01 • DIGITAL CASE MANAGEMENT</span><h2>Master Vault & Explorer</h2><p>Ingest, search, verify and manage digital legal records.</p></div><span class="feature-status">● LIVE VAULT</span></div>
         <!-- Interactive Quick-Action Workspace Hero -->
         <div class="quick-hero-grid">
             <div class="hero-action-card" onclick="focusAction('ingest')">
@@ -2176,8 +2716,66 @@ DASHBOARD_PAGE = """
             </div>
         </div>
 
-        <!-- TAB 1: MASTER VAULT & CASE EXPLORER -->
-        <div id="view-vault" class="tab-content active">
+        <!-- Blockchain Integrity Anchor -->
+        <div class="card" style="margin-bottom:18px; border:1px solid rgba(16,185,129,.35);">
+            <div class="card-header">
+                <span>⛓️ Permissioned Blockchain Evidence Anchor</span>
+                <span class="tag">SHA-256 Block Chain</span>
+            </div>
+            <div style="display:flex; gap:18px; align-items:center; flex-wrap:wrap;">
+                <div><span style="font-size:10px;color:var(--text-muted);text-transform:uppercase;">Chain Status</span><div id="blockchainStatus" style="font-weight:800;color:var(--success-text);">Checking...</div></div>
+                <div><span style="font-size:10px;color:var(--text-muted);text-transform:uppercase;">Blocks</span><div id="blockchainBlocks" style="font-weight:800;">0</div></div>
+                <div style="flex:1;min-width:260px;"><span style="font-size:10px;color:var(--text-muted);text-transform:uppercase;">Latest Anchor</span><div id="blockchainHash" class="mono">No blocks yet</div></div>
+                <button type="button" class="btn-primary btn-blue" onclick="verifyBlockchainNow()">Verify Blockchain</button>
+            </div>
+            <p style="font-size:10px;color:var(--text-muted);margin:10px 0 0;">Sensitive files remain in the secure vault; the ledger stores cryptographic document/event anchors so later changes are detectable.</p>
+        </div>
+
+        <!-- 26190 CORE DMS: SEARCH + VERSION CONTROL + AUTHORIZED COLLABORATION -->
+        <div class="card" style="margin-bottom:18px; border:1px solid rgba(37,99,235,.35);">
+            <div class="card-header">
+                <span>📚 Legal Document Workspace</span>
+                <span class="tag">26190 DMS CORE</span>
+            </div>
+            <div class="grid-2">
+                <div>
+                    <label class="form-label">🔎 Secure Document Search</label>
+                    <input id="dmsSearchQ" placeholder="Case/FIR, title, filename, type, OCR keyword...">
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+                        <input id="dmsSearchCase" placeholder="Case / FIR" style="flex:1;min-width:120px;">
+                        <select id="dmsSearchType" style="flex:1;min-width:150px;"><option value="">All document types</option>{% for t in document_types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}</select>
+                        <button type="button" class="btn-primary btn-blue" onclick="dmsSearch()">Search</button>
+                    </div>
+                    <div id="dmsSearchOut" style="margin-top:10px;max-height:230px;overflow:auto;"></div>
+                </div>
+                <div>
+                    <label class="form-label">🧬 Create Immutable Document Version</label>
+                    <input id="versionDocId" type="number" placeholder="Parent Document ID">
+                    <input id="versionNote" placeholder="Change note / reason">
+                    <input id="versionFile" type="file" style="margin-top:6px;">
+                    <button type="button" class="btn-primary btn-emerald" onclick="createDmsVersion()">Create Version + Hash + Blockchain Anchor</button>
+                    <pre id="versionOut" style="max-height:150px;overflow:auto;"></pre>
+                </div>
+            </div>
+            <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border-color);">
+                <label class="form-label">🤝 Authorized Stakeholder Collaboration</label>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    <input id="collabDocId" type="number" placeholder="Document ID" style="flex:1;min-width:120px;">
+                    <input id="collabUser" placeholder="Officer username (optional)" style="flex:1;min-width:160px;">
+                    <select id="collabRole" style="flex:1;min-width:160px;">
+                        <option value="">No role grant</option>
+                        <option>Police Inspector</option><option>Presiding Judge</option><option>Court Administrator</option><option>Forensic Officer</option><option>Legal Officer</option><option>Investigating Officer</option>
+                    </select>
+                    <select id="collabPerm" style="flex:1;min-width:120px;"><option>READ</option><option>COMMENT</option><option>SHARE</option><option>WRITE</option></select>
+                    <button type="button" class="btn-primary btn-blue" onclick="grantDmsAccess()">Grant Access</button>
+                </div>
+                <textarea id="collabMessage" rows="2" placeholder="Secure case note / collaboration message"></textarea>
+                <button type="button" class="btn-primary btn-emerald" onclick="postDmsMessage()">Post Authorized Case Note</button>
+                <button type="button" class="btn-primary btn-blue" onclick="loadDmsMessages()">Load Case Notes</button>
+                <pre id="collabOut" style="max-height:180px;overflow:auto;"></pre>
+            </div>
+        </div>
+
             <div class="grid-2">
                 <div class="card" id="cardIngest">
                     <div class="card-header">
@@ -2185,9 +2783,18 @@ DASHBOARD_PAGE = """
                         <span class="tag">SHA-256 Seal</span>
                     </div>
                     <form id="uploadForm">
-                        <label class="form-label">Select Evidence Record (FIR / Charge Sheet / Forensic Report)</label>
+                        <label class="form-label">Case / FIR Docket Number</label>
+                        <input type="text" id="caseNoInput" placeholder="e.g. FIR-2026/891 (leave blank for auto-generated case)">
+                        <label class="form-label">Document Title</label>
+                        <input type="text" id="docTitleInput" placeholder="e.g. Witness Statement – Case 891">
+                        <label class="form-label">Document Type</label>
+                        <select id="docTypeInput">
+                            <option value="">Auto-detect from document</option>
+                            {% for t in document_types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+                        </select>
+                        <label class="form-label">Select Legal / Investigation Document</label>
                         <input type="file" id="fileInput" required>
-                        <button type="submit" class="btn-primary btn-emerald">Ingest & Calculate SHA-256 Digest</button>
+                        <button type="submit" class="btn-primary btn-emerald">Ingest, Hash & Blockchain Seal</button>
                     </form>
                     <div id="uploadRes" style="display: none; margin-top: 15px; padding: 12px; background: var(--card-inner); border-radius: 8px; border: 1px solid var(--border-color);">
                         <span style="font-size: 11px; color: var(--emerald-secure); font-weight: bold;">CRYPTOGRAPHIC DIGEST ISSUED:</span>
@@ -2271,6 +2878,7 @@ DASHBOARD_PAGE = """
 
         <!-- TAB 2: EVIDENCE LOCKER -->
         <div id="view-locker" class="tab-content">
+            <div class="feature-page-header"><div><span class="feature-kicker">02 • PHYSICAL EVIDENCE</span><h2>Physical Evidence Locker</h2><p>Register, tag and track physical evidence custody.</p></div><span class="feature-status">● CUSTODY</span></div>
             <div class="grid-2">
                 <div class="card">
                     <div class="card-header">
@@ -2311,6 +2919,7 @@ DASHBOARD_PAGE = """
 
         <!-- TAB 3: REDACTION TOOL -->
         <div id="view-redaction" class="tab-content">
+            <div class="feature-page-header"><div><span class="feature-kicker">03 • PRIVACY</span><h2>Judicial Redaction Tool</h2><p>Create court-safe anonymized disclosure copies.</p></div><span class="feature-status">● PRIVACY</span></div>
             <div class="grid-2">
                 <div class="card">
                     <div class="card-header">
@@ -2335,6 +2944,7 @@ DASHBOARD_PAGE = """
 
         <!-- TAB 4: HARDWARE ATTESTATION -->
         <div id="view-attestation" class="tab-content">
+            <div class="feature-page-header"><div><span class="feature-kicker">04 • SYSTEM INTEGRITY</span><h2>Hardware Telemetry</h2><p>Review node, cryptographic and integrity telemetry.</p></div><span class="feature-status">● TELEMETRY</span></div>
             <div class="card">
                 <div class="card-header">
                     <span>System Integrity Telemetry</span>
@@ -2363,6 +2973,7 @@ DASHBOARD_PAGE = """
 
         <!-- TAB 5: ADVANCED SECURITY CONTROL PLANE -->
         <div id="view-advanced" class="tab-content">
+            <div class="feature-page-header"><div><span class="feature-kicker">05 • SECURITY CONTROL</span><h2>Advanced Security Control Plane</h2><p>Manage privacy proofs, approvals, access and defensive controls.</p></div><span class="feature-status">● HARDENED</span></div>
             <div class="grid-2">
                 <div class="card"><div class="card-header"><span>Post-Quantum Hybrid Security</span><span class="tag">ML-KEM + X25519</span></div><p id="pqcStatus">Checking cryptographic provider...</p></div>
                 <div class="card"><div class="card-header"><span>Selective Disclosure</span><span class="tag">Privacy Proof</span></div><input id="zkClaim" placeholder="Claim, e.g. age >= 18"><input id="zkSecret" type="password" placeholder="Verifier secret"><button class="btn-primary btn-blue" onclick="makeProof()">Create Proof</button><pre id="zkOut"></pre></div>
@@ -2379,7 +2990,7 @@ DASHBOARD_PAGE = """
                 <div class="card"><div class="card-header"><span>Threshold Key Protection</span><span class="tag">M-of-N / Shamir</span></div><input id="shThreshold" type="number" value="3" min="2"><input id="shShares" type="number" value="5" min="2"><button class="btn-primary btn-blue" onclick="makeShares()">Create Key Shares</button><pre id="shOut"></pre></div>
                 <div class="card"><div class="card-header"><span>Compliance Engine</span><span class="tag">DPDP / GDPR / HIPAA</span></div><button class="btn-primary btn-blue" onclick="runCompliance()">Run Compliance Check</button><pre id="complianceOut"></pre></div>
                 <div class="card"><div class="card-header"><span>Residency + Circuit Breakers</span><span class="tag">Policy Enforcement</span></div><p id="residencyOut">Checking...</p><button class="btn-primary btn-blue" onclick="loadResidency()">Refresh Residency</button><button class="btn-primary btn-rose" onclick="triggerBreaker()">Test Circuit Breaker</button><pre id="breakerOut"></pre></div>
-                <div class="card"><div class="card-header"><span>AI Agent Safety</span><span class="tag">Read-only / Retired</span></div><p id="aiModeOut">Checking LawGPT mode...</p><button class="btn-primary btn-blue" onclick="loadAIMode()">Refresh AI Mode</button><button class="btn-primary btn-rose" onclick="setSafeAI()">Put AI in Safe Mode</button></div>
+                <div class="card"><div class="card-header"><span>AI Agent Safety</span><span class="tag">Read-only / Retired</span></div><p id="aiModeOut">Checking Case Intelligence mode...</p><button class="btn-primary btn-blue" onclick="loadAIMode()">Refresh AI Mode</button><button class="btn-primary btn-rose" onclick="setSafeAI()">Put AI in Safe Mode</button></div>
                 <div class="card"><div class="card-header"><span>Remote Attestation</span><span class="tag">SGX / SEV Policy</span></div><input id="attProvider" placeholder="SGX/SEV"><input id="attMeasurement" placeholder="Expected measurement"><textarea id="attQuote" rows="2" placeholder="Attestation quote / signed envelope"></textarea><button class="btn-primary btn-blue" onclick="verifyAttestation()">Verify Attestation</button><pre id="attOut"></pre></div>
                 <div class="card"><div class="card-header"><span>Kill-Switch Propagation</span><span class="tag">Agent → Tool → Platform</span></div><select id="killScope"><option value="agent">Agent</option><option value="tool">Tool</option><option value="platform">Platform-wide</option></select><button class="btn-primary btn-rose" onclick="propagateKill()">Propagate Kill</button><pre id="killOut"></pre></div>
                 <div class="card"><div class="card-header"><span>Forensic Snapshot</span><span class="tag">Write-Once Hash</span></div><button class="btn-primary btn-blue" onclick="loadSnapshots()">View Sealed Snapshots</button><pre id="snapshotOut"></pre></div>
@@ -2394,6 +3005,7 @@ DASHBOARD_PAGE = """
 
         <!-- TAB 6: VAULT SHELF HEATMAP -->
         <div id="view-heatmap" class="tab-content">
+            <div class="feature-page-header"><div><span class="feature-kicker">06 • FACILITY VIEW</span><h2>Vault Shelf Heatmap</h2><p>Monitor evidence locker bay occupancy and facility status.</p></div><span class="feature-status">● FACILITY</span></div>
             <div class="card">
                 <div class="card-header">
                     <span>🗺️ Central Evidence Vault - 3D Shelf Heatmap & Occupancy</span>
@@ -2414,31 +3026,34 @@ DASHBOARD_PAGE = """
         let currentOriginalText = "";
 
         // ---------------- THEME (Dark / Light) ---------------- //
-        function applyTheme(theme) {
-            const btn = document.getElementById('themeToggleBtn');
-            if (theme === 'light') {
-                document.body.classList.add('light-theme');
-                if (btn) btn.innerText = '☀️';
-            } else {
-                document.body.classList.remove('light-theme');
-                if (btn) btn.innerText = '🌙';
-            }
-        }
-
-        function toggleTheme() {
-            const isLight = document.body.classList.contains('light-theme');
-            const nextTheme = isLight ? 'dark' : 'light';
-            applyTheme(nextTheme);
-            try { localStorage.setItem('sdems_theme', nextTheme); } catch (e) { /* storage unavailable, theme just won't persist */ }
-        }
-
+        // Kept independent from API calls so the theme always works even if
+        // the backend is temporarily unavailable.
+        window.applyTheme = function(theme) {
+            const normalized = String(theme || '').toLowerCase() === 'light' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', normalized);
+            document.body.classList.toggle('light-theme', normalized === 'light');
+            document.querySelectorAll('#themeToggleBtn').forEach(btn => {
+                btn.textContent = normalized === 'light' ? '☀️' : '🌙';
+                btn.setAttribute('aria-label', normalized === 'light' ? 'Switch to dark theme' : 'Switch to light theme');
+                btn.title = normalized === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+            });
+            try { localStorage.setItem('sdems_theme', normalized); } catch (_) {}
+            return normalized;
+        };
+        window.toggleTheme = function() {
+            const current = document.documentElement.getAttribute('data-theme') ||
+                (document.body.classList.contains('light-theme') ? 'light' : 'dark');
+            return window.applyTheme(current === 'light' ? 'dark' : 'light');
+        };
         (function initTheme() {
-            let saved = null;
-            try { saved = localStorage.getItem('sdems_theme'); } catch (e) { /* ignore */ }
-            if (!saved) {
+            let saved = '';
+            try { saved = localStorage.getItem('sdems_theme') || ''; } catch (_) {}
+            if (saved !== 'light' && saved !== 'dark') {
                 saved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
             }
-            applyTheme(saved);
+            // Apply before the first paint where possible.
+            window.applyTheme(saved);
+            window.addEventListener('DOMContentLoaded', () => window.applyTheme(saved));
         })();
 
         let currentSuspectText = "";
@@ -2450,33 +3065,116 @@ DASHBOARD_PAGE = """
         // Handles session-expiry (401 -> redirect to login) and non-JSON
         // responses (e.g. a stray HTML error page) gracefully instead of
         // throwing an unhandled parse error.
-        async function safeFetchJson(url, options) {
+        // One request gateway for every dashboard feature. The token is embedded
+        // in the page AND kept in a JS fallback so older cached pages cannot
+        // accidentally send a POST without CSRF protection.
+        let PAGE_CSRF_TOKEN = {{ csrf_token|tojson }};
+
+        // Visible, non-blocking error surface for every feature.
+        window.showUiError = function(message) {
+            let box = document.getElementById('uiToast');
+            if (!box) {
+                box = document.createElement('div');
+                box.id = 'uiToast';
+                box.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:5000;max-width:440px;padding:12px 14px;border:1px solid var(--border-color);border-left:4px solid var(--danger-text);border-radius:8px;background:var(--card-bg);color:var(--text-main);font-size:12px;box-shadow:0 12px 30px rgba(0,0,0,.28);';
+                document.body.appendChild(box);
+            }
+            box.textContent = String(message || 'Operation failed.');
+            clearTimeout(window.__uiToastTimer);
+            window.__uiToastTimer = setTimeout(() => box.remove(), 5000);
+        };
+
+        async function safeFetchJson(url, options, retrying) {
+            options = options || {};
+            const method = String(options.method || 'GET').toUpperCase();
+            const requestOptions = Object.assign({}, options);
+            if (!['GET','HEAD','OPTIONS'].includes(method)) {
+                requestOptions.headers = new Headers(options.headers || {});
+                const meta = document.querySelector('meta[name="csrf-token"]');
+                const cookieToken = (document.cookie.match(/(?:^|; )sdems_csrf=([^;]+)/) || [])[1] || '';
+                const token = (meta && meta.content) || PAGE_CSRF_TOKEN || cookieToken || '';
+                if (token) requestOptions.headers.set('X-CSRF-Token', token);
+            }
             let res;
             try {
-                res = await fetch(url, options);
+                res = await fetch(url, requestOptions);
             } catch (networkErr) {
-                alert("⚠️ Network error: could not reach the server. Please check your connection and try again.");
+                window.showUiError('Server connection failed. Check that the app is running, then try again.');
                 throw networkErr;
             }
 
             if (res.status === 401) {
-                alert("⚠️ Your session has expired. Please log in again.");
-                window.location.href = '/login';
-                throw new Error("session_expired");
+                window.showUiError('Session expired. Returning to the login screen…');
+                setTimeout(() => { window.location.href = '/login'; }, 600);
+                throw new Error('session_expired');
             }
 
-            const contentType = res.headers.get("content-type") || "";
-            if (!contentType.includes("application/json")) {
-                alert("⚠️ Unexpected server response. Please try again.");
-                throw new Error("non_json_response");
+            const contentType = res.headers.get('content-type') || '';
+            if (!contentType.includes('application/json')) {
+                window.showUiError('The server returned an unexpected response. Please retry the operation.');
+                throw new Error('non_json_response');
             }
 
             const data = await res.json();
             if (!res.ok) {
-                alert("⚠️ " + (data.message || "Something went wrong. Please try again."));
-                throw new Error(data.error || "request_failed");
+                if (res.status === 403 && data.error === 'csrf_failed' && !retrying) {
+                    // Recover stale tabs/mobile WebViews without forcing the user
+                    // to reload the whole dashboard. The server keeps one token
+                    // per session and returns its current value here.
+                    try {
+                        const tokenRes = await fetch('/api/session/csrf', {cache:'no-store', credentials:'same-origin'});
+                        if (tokenRes.ok) {
+                            const tokenData = await tokenRes.json();
+                            if (tokenData && tokenData.csrf_token) {
+                                PAGE_CSRF_TOKEN = tokenData.csrf_token;
+                                return await safeFetchJson(url, options, true);
+                            }
+                        }
+                    } catch (_) {}
+                    window.showUiError('Security session could not be refreshed. Please reload the page once.');
+                    throw new Error('csrf_refresh_failed');
+                }
+                window.showUiError(data.message || 'The operation could not be completed.');
+                throw new Error(data.error || 'request_failed');
             }
             return data;
+        }
+
+        // Global bindings for the remaining Advanced Security controls.
+        window.createDID = async function(){try{const d=await safeFetchJson('/api/did/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});document.getElementById('didValue').value=d.did||'';document.getElementById('didOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('didOut').textContent=e.message;}}
+        window.linkDID = async function(){try{const d=await safeFetchJson('/api/did/link',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({did:document.getElementById('didValue').value,doc_id:document.getElementById('didDocId').value})});const v=await safeFetchJson('/api/did/vc',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({did:document.getElementById('didValue').value,doc_id:document.getElementById('didDocId').value})});document.getElementById('didOut').textContent=JSON.stringify({link:d,vc:v},null,2);}catch(e){document.getElementById('didOut').textContent=e.message;}}
+        window.makeShares = async function(){try{const d=await safeFetchJson('/api/threshold/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold:+document.getElementById('shThreshold').value,shares:+document.getElementById('shShares').value})});document.getElementById('shOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('shOut').textContent=e.message;}}
+        window.runCompliance = async function(){try{const d=await safeFetchJson('/api/compliance/report');document.getElementById('complianceOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('complianceOut').textContent=e.message;}}
+        window.loadResidency = async function(){try{const d=await safeFetchJson('/api/residency/status');document.getElementById('residencyOut').textContent=JSON.stringify(d,null,2);const b=await safeFetchJson('/api/circuit-breaker/status');document.getElementById('breakerOut').textContent=JSON.stringify(b,null,2);}catch(e){document.getElementById('residencyOut').textContent=e.message;}}
+        window.triggerBreaker = async function(){try{const d=await safeFetchJson('/api/circuit-breaker/trigger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'manual_test',reason:'administrator test'})});document.getElementById('breakerOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('breakerOut').textContent=e.message;}}
+        window.loadAIMode = async function(){try{const d=await safeFetchJson('/api/ai/mode');document.getElementById('aiModeOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('aiModeOut').textContent=e.message;}}
+        window.setSafeAI = async function(){try{const d=await safeFetchJson('/api/ai/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'SAFE_READ_ONLY',reason:'security anomaly detected'})});document.getElementById('aiModeOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('aiModeOut').textContent=e.message;}}
+        window.verifyAttestation = async function(){try{const d=await safeFetchJson('/api/attestation/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:document.getElementById('attProvider').value,measurement:document.getElementById('attMeasurement').value,quote:document.getElementById('attQuote').value})});document.getElementById('attOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('attOut').textContent=e.message;}}
+        window.propagateKill = async function(){try{const d=await safeFetchJson('/api/kill-switch/propagate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scope:document.getElementById('killScope').value,target:'LawGPT',reason:'manual security response'})});document.getElementById('killOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('killOut').textContent=e.message;}}
+        window.loadSnapshots = async function(){try{const d=await safeFetchJson('/api/forensic/snapshots');document.getElementById('snapshotOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('snapshotOut').textContent=e.message;}}
+        window.runRedTeam = async function(){try{const d=await safeFetchJson('/api/security/redteam',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent:'LawGPT'})});document.getElementById('redteamOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('redteamOut').textContent=e.message;}}
+        window.verifyMedia = async function(){const f=document.getElementById('mediaVerifyFile')?.files[0];if(!f){alert('Select audio/video first.');return;}const fd=new FormData();fd.append('file',f);try{const d=await safeFetchJson('/api/media/verify',{method:'POST',body:fd});document.getElementById('mediaOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('mediaOut').textContent=e.message;}}
+        window.checkPoisoning = async function(){try{const d=await safeFetchJson('/api/ai/knowledge/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:document.getElementById('poisonText').value})});document.getElementById('poisonOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('poisonOut').textContent=e.message;}}
+        window.loadBlockchain = async function(){
+            try {
+                const d=await safeFetchJson('/api/blockchain/status');
+                const c=d.chain||{};
+                const st=document.getElementById('blockchainStatus');
+                const bl=document.getElementById('blockchainBlocks');
+                const bh=document.getElementById('blockchainHash');
+                if(st){st.textContent=c.valid?'✅ INTACT':'🚨 BROKEN'; st.style.color=c.valid?'var(--success-text)':'var(--danger-text)';}
+                if(bl) bl.textContent=c.total_blocks||0;
+                if(bh) bh.textContent=c.latest_hash||'No blocks yet';
+            } catch(e){}
+        }
+        window.verifyBlockchainNow = async function(){
+            try {
+                const d=await safeFetchJson('/api/blockchain/verify');
+                const st=document.getElementById('blockchainStatus');
+                if(st){st.textContent=d.valid?'✅ BLOCKCHAIN INTACT':'🚨 BLOCKCHAIN BROKEN'; st.style.color=d.valid?'var(--success-text)':'var(--danger-text)';}
+                if(document.getElementById('blockchainBlocks')) document.getElementById('blockchainBlocks').textContent=d.total_blocks||0;
+                if(document.getElementById('blockchainHash')) document.getElementById('blockchainHash').textContent=d.latest_hash||'';
+            } catch(e){ console.error(e); }
         }
 
         let recognition = null;
@@ -2556,7 +3254,7 @@ DASHBOARD_PAGE = """
                 btn.style.color = '#10b981';
                 btn.style.borderColor = '#10b981';
                 btn.innerText = '🔊 On';
-                speakText("LawGPT voice readout activated.");
+                speakText("Case Intelligence voice readout activated.");
             } else {
                 btn.style.color = '#94a3b8';
                 btn.style.borderColor = '#334155';
@@ -2576,20 +3274,32 @@ DASHBOARD_PAGE = """
         }
 
         function switchDrawerTab(tabName, el) {
+            const target = document.getElementById('view-' + tabName);
+            if (!target) return;
             document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.getElementById('view-' + tabName).classList.add('active');
+            target.classList.add('active');
             if (el) el.classList.add('active');
             closeDrawer();
+            // Every feature behaves like its own workspace: never leave the user
+            // at the previous feature's scroll position.
+            requestAnimationFrame(() => {
+                const header = document.querySelector('.feature-page-header');
+                if (header && target.contains(header)) {
+                    window.scrollTo({ top: Math.max(0, header.getBoundingClientRect().top + window.scrollY - 12), behavior: 'smooth' });
+                } else {
+                    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            });
         }
 
         function focusAction(action) {
             switchDrawerTab('vault', document.querySelectorAll('.nav-item')[0]);
             if (action === 'ingest') {
-                document.getElementById('cardIngest').scrollIntoView({ behavior: 'smooth' });
+                document.getElementById('cardIngest').scrollIntoView({ behavior: 'smooth', block: 'start' });
                 document.getElementById('fileInput').focus();
             } else if (action === 'verify') {
-                document.getElementById('cardVerify').scrollIntoView({ behavior: 'smooth' });
+                document.getElementById('cardVerify').scrollIntoView({ behavior: 'smooth', block: 'start' });
                 document.getElementById('verifyFileInput').focus();
             }
         }
@@ -2711,7 +3421,7 @@ DASHBOARD_PAGE = """
 
                 if (data.audit_logs.length > 0) {
                     const top = data.audit_logs[0];
-                    document.getElementById('tickerFeed').innerText = `[${top.timestamp}] ACTION: ${top.action} on "${top.filename}" by ${top.username} (${top.role}) -> STATUS: ${top.status}`;
+                    document.getElementById('tickerFeed').innerText = `[${top.timestamp}] ACTION: ${top.action} on "${top.filename}" by ${top.username} (${top.role}) -> STATUS: ${top.status} | BLOCKCHAIN ANCHOR: ${data.blockchain?.valid ? 'INTACT' : 'CHECK'}`;
                 }
 
                 renderVaultHeatmap(data.locker);
@@ -2747,7 +3457,7 @@ DASHBOARD_PAGE = """
                                 <ul style="list-style: none; margin-bottom: 12px; font-size: 12px; font-family: monospace;">
                                     ${contents.docs.map(d => `
                                         <li style="padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
-                                            <span>📄 <b>${d.original_filename}</b> <span style="color: var(--text-muted);">(${d.file_hash.substring(0, 16)}...)</span></span>
+                                            <span>📄 <b>${d.original_filename}</b> <span style="color: var(--text-muted);">(${d.doc_type || 'Evidence Record'} · ${d.file_hash.substring(0, 16)}...)</span></span>
                                             <a href="/certificate/${encodeURIComponent(d.original_filename)}" target="_blank" style="color: var(--emerald-secure); font-weight: bold; text-decoration: underline;">View 65B Cert</a>
                                         </li>
                                     `).join('')}
@@ -2792,6 +3502,27 @@ DASHBOARD_PAGE = """
             }
         }
 
+        // Boot every independent read-only surface. A missing optional provider
+        // must never prevent the core vault/ledger from loading.
+        async function bootDashboard() {
+            const jobs = [
+                ['ledger', fetchAllData],
+                ['blockchain', window.loadBlockchain],
+                ['pqc', window.loadPQC],
+                ['enclave', window.loadEnclave],
+                ['lockdown', window.loadLockdown],
+                ['ai_mode', window.loadAIMode],
+                ['residency', window.loadResidency],
+                ['security_events', window.loadSecurityEvents],
+            ];
+            for (const [name, fn] of jobs) {
+                if (typeof fn !== 'function') continue;
+                try { await fn(); } catch (e) { console.warn('Dashboard bootstrap:', name, e); }
+            }
+        }
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootDashboard, {once:true});
+        else bootDashboard();
+
         document.getElementById('uploadForm').onsubmit = async (e) => {
             e.preventDefault();
             const file = document.getElementById('fileInput').files[0];
@@ -2804,6 +3535,9 @@ DASHBOARD_PAGE = """
             try {
                 const fd = new FormData();
                 fd.append('file', file);
+                fd.append('case_no', document.getElementById('caseNoInput')?.value || '');
+                fd.append('title', document.getElementById('docTitleInput')?.value || '');
+                fd.append('doc_type', document.getElementById('docTypeInput')?.value || '');
 
                 const data = await safeFetchJson('/upload', { method: 'POST', body: fd });
 
@@ -2813,7 +3547,7 @@ DASHBOARD_PAGE = """
 
                 currentIsTampered = false;
                 currentDiffSummary = [];
-                // The server now extracts text/OCR during ingestion, so LawGPT
+                // The server now extracts text/OCR during ingestion, so Case Intelligence
                 // works immediately for PDFs/images as well as plain text files.
                 currentOriginalText = String(data.extracted_text || '').slice(0, 2_000_000);
                 currentSuspectText = currentOriginalText;
@@ -2832,46 +3566,15 @@ DASHBOARD_PAGE = """
                 }
 
                 let uploadMessage = `✅ File ${data.filename} uploaded and sealed successfully. SHA-256 matches the newly registered baseline.`;
+                if (data.blockchain) uploadMessage += `\n⛓️ Blockchain anchor #${data.blockchain.block_index} created: ${data.blockchain.block_hash.slice(0, 20)}...`;
                 if (data.extracted_text) {
-                    uploadMessage += `\n🧠 ${data.extraction_engine} extraction completed. LawGPT can now analyze this file.`;
+                    uploadMessage += `\n🧠 ${data.extraction_engine} extraction completed. Case Intelligence can now analyze this file.`;
                 } else if (data.extraction_warning) {
                     uploadMessage += `\nℹ️ Text/OCR extraction is unavailable for this file, but the original evidence remains securely sealed.`;
                 }
                 addChatMessage("ai", uploadMessage);
 
                 document.getElementById('uploadForm').reset();
-                async function runOCR(){
-            const f=document.getElementById('ocrFile').files[0]; if(!f){alert('Select a document first.');return;}
-            const fd=new FormData(); fd.append('file',f); fd.append('language',document.getElementById('ocrLang').value||'eng+hin');
-            try{const d=await safeFetchJson('/api/ocr/parse',{method:'POST',body:fd}); document.getElementById('ocrOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('ocrOut').textContent='OCR failed: '+e.message;}
-        }
-        async function loadEnclave(){try{const d=await safeFetchJson('/api/security/confidential-computing'); document.getElementById('enclaveStatus').textContent=`${d.status} — provider: ${d.provider_config}${d.warning?' — '+d.warning:''}`;}catch(e){}}
-        async function loadLockdown(){try{const d=await safeFetchJson('/api/security/lockdown'); document.getElementById('lockdownStatus').textContent=d.lockdown?'🚨 LOCKDOWN ACTIVE: '+d.reason:'✅ NORMAL OPERATING MODE';}catch(e){}}
-        async function toggleLockdown(active){const reason=document.getElementById('lockReason').value||'Emergency security lockdown'; const action=active?'activate':'deactivate'; try{const d=await safeFetchJson('/api/security/lockdown',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,reason})}); document.getElementById('lockOut').textContent=JSON.stringify(d,null,2); loadLockdown();}catch(e){document.getElementById('lockOut').textContent=e.message;}}
-        async function createDID(){try{const d=await safeFetchJson('/api/did/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});document.getElementById('didValue').value=d.did||'';document.getElementById('didOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('didOut').textContent=e.message;}}
-        async function linkDID(){try{const d=await safeFetchJson('/api/did/link',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({did:document.getElementById('didValue').value,doc_id:document.getElementById('didDocId').value})});const v=await safeFetchJson('/api/did/vc',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({did:document.getElementById('didValue').value,doc_id:document.getElementById('didDocId').value})});document.getElementById('didOut').textContent=JSON.stringify({link:d,vc:v},null,2);}catch(e){document.getElementById('didOut').textContent=e.message;}}
-        async function makeShares(){try{const d=await safeFetchJson('/api/threshold/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold:+document.getElementById('shThreshold').value,shares:+document.getElementById('shShares').value})});document.getElementById('shOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('shOut').textContent=e.message;}}
-        async function runCompliance(){try{const d=await safeFetchJson('/api/compliance/report');document.getElementById('complianceOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('complianceOut').textContent=e.message;}}
-        async function loadResidency(){try{const d=await safeFetchJson('/api/residency/status');document.getElementById('residencyOut').textContent=JSON.stringify(d,null,2);const b=await safeFetchJson('/api/circuit-breaker/status');document.getElementById('breakerOut').textContent=JSON.stringify(b,null,2);}catch(e){document.getElementById('residencyOut').textContent=e.message;}}
-        async function triggerBreaker(){try{const d=await safeFetchJson('/api/circuit-breaker/trigger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'manual_test',reason:'administrator test'})});document.getElementById('breakerOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('breakerOut').textContent=e.message;}}
-        async function loadAIMode(){try{const d=await safeFetchJson('/api/ai/mode');document.getElementById('aiModeOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('aiModeOut').textContent=e.message;}}
-        async function setSafeAI(){try{const d=await safeFetchJson('/api/ai/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'SAFE_READ_ONLY',reason:'security anomaly detected'})});document.getElementById('aiModeOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('aiModeOut').textContent=e.message;}}
-        async function verifyAttestation(){try{const d=await safeFetchJson('/api/attestation/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:document.getElementById('attProvider').value,measurement:document.getElementById('attMeasurement').value,quote:document.getElementById('attQuote').value})});document.getElementById('attOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('attOut').textContent=e.message;}}
-        async function propagateKill(){try{const d=await safeFetchJson('/api/kill-switch/propagate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scope:document.getElementById('killScope').value,target:'LawGPT',reason:'manual security response'})});document.getElementById('killOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('killOut').textContent=e.message;}}
-        async function loadSnapshots(){try{const d=await safeFetchJson('/api/forensic/snapshots');document.getElementById('snapshotOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('snapshotOut').textContent=e.message;}}
-        async function runRedTeam(){try{const d=await safeFetchJson('/api/security/redteam',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent:'LawGPT'})});document.getElementById('redteamOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('redteamOut').textContent=e.message;}}
-        async function verifyMedia(){const f=document.getElementById('mediaVerifyFile')?.files[0];if(!f){alert('Select audio/video first.');return;}const fd=new FormData();fd.append('file',f);try{const d=await safeFetchJson('/api/media/verify',{method:'POST',body:fd});document.getElementById('mediaOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('mediaOut').textContent=e.message;}}
-        async function checkPoisoning(){try{const d=await safeFetchJson('/api/ai/knowledge/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:document.getElementById('poisonText').value})});document.getElementById('poisonOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('poisonOut').textContent=e.message;}}
-        async function loadPQC(){ try { const d=await safeFetchJson('/api/security/pqc'); document.getElementById('pqcStatus').textContent=`${d.mode}${d.warning ? ' — '+d.warning : ' — ready'}`; } catch(e){} }
-        async function makeProof(){ try { const d=await safeFetchJson('/api/zkp/prove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim:document.getElementById('zkClaim').value,secret:document.getElementById('zkSecret').value})}); document.getElementById('zkOut').textContent=JSON.stringify(d.proof,null,2); }catch(e){} }
-        async function grantAccess(){ try { const d=await safeFetchJson('/api/access/grant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('accessDocId').value,minutes:document.getElementById('accessMinutes').value})}); document.getElementById('accessOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function signApproval(){ try { const d=await safeFetchJson('/api/approvals/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('approvalDocId').value,decision:'APPROVE'})}); document.getElementById('approvalOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function issueVC(){ try { const d=await safeFetchJson('/api/vc/issue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('vcDocId').value})}); document.getElementById('vcOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function loadSecurityEvents(){ try { const d=await safeFetchJson('/api/security/events'); document.getElementById('riskOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function offlineProof(){ try { const d=await safeFetchJson('/api/offline/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('offlineDocId').value})}); document.getElementById('offlineOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function crossChainProof(){ try { const d=await safeFetchJson('/api/crosschain/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proof:document.getElementById('chainProof').value})}); document.getElementById('chainOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        loadPQC();
-        fetchAllData();
             } catch (err) {
                 console.error("Upload failed", err);
             } finally {
@@ -2946,36 +3649,26 @@ DASHBOARD_PAGE = """
                 document.getElementById('modDocContent').innerText = data.current_text || 'Uploaded file empty or binary.';
 
                 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+                // Keep the complete tamper breakdown on ONE horizontal line.
                 let summaryHTML = '';
                 if (data.summary && data.summary.length > 0) {
-                    summaryHTML = data.summary.map(s => {
-                        const safeText = escapeHtml(s.text);
-                        if (s.type === 'removed') {
-                            return `<div class="summary-item item-deleted"><b>❌ REMOVED FROM BASELINE:</b> "${safeText}"</div>`;
-                        } else {
-                            return `<div class="summary-item item-added"><b>⚠️ ADDED / ALTERED:</b> "${safeText}"</div>`;
-                        }
-                    }).join('');
+                    const removed = data.summary.filter(s => s.type === 'removed').map(s => escapeHtml(s.text));
+                    const added = data.summary.filter(s => s.type !== 'removed').map(s => escapeHtml(s.text));
+                    const parts = [];
+                    if (removed.length) parts.push(`❌ REMOVED FROM BASELINE: ${removed.join(' | ')}`);
+                    if (added.length) parts.push(`⚠️ ADDED / ALTERED: ${added.join(' | ')}`);
+                    summaryHTML = `<div class="summary-item item-deleted tamper-one-line" title="Tamper discrepancy details">🚨 TAMPER ALERT — ${parts.join('  •  ')}</div>`;
                 } else {
-                    summaryHTML = '<div class="summary-item item-deleted"><b>🚨 Tamper Reason:</b> Entire file contents or hashes differ from the registered master copy.</div>';
+                    summaryHTML = '<div class="summary-item item-deleted tamper-one-line">🚨 TAMPER ALERT — Entire file contents or hashes differ from the registered master copy.</div>';
                 }
                 document.getElementById('humanSummary').innerHTML = summaryHTML;
 
-                const tamperMsg = `🚨 TAMPER ALERT. ${data.current_filename} does not match the registered baseline. Differences were detected.`;
+                const tamperMsg = `🚨 TAMPER ALERT. ${data.current_filename} does not match the registered baseline. Differences were detected.` + (data.blockchain ? ` Blockchain verification event anchored at block #${data.blockchain.block_index}.` : '');
                 addChatMessage("ai", tamperMsg);
             }
 
             document.getElementById('verifyForm').reset();
-            async function loadPQC(){ try { const d=await safeFetchJson('/api/security/pqc'); document.getElementById('pqcStatus').textContent=`${d.mode}${d.warning ? ' — '+d.warning : ' — ready'}`; } catch(e){} }
-        async function makeProof(){ try { const d=await safeFetchJson('/api/zkp/prove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim:document.getElementById('zkClaim').value,secret:document.getElementById('zkSecret').value})}); document.getElementById('zkOut').textContent=JSON.stringify(d.proof,null,2); }catch(e){} }
-        async function grantAccess(){ try { const d=await safeFetchJson('/api/access/grant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('accessDocId').value,minutes:document.getElementById('accessMinutes').value})}); document.getElementById('accessOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function signApproval(){ try { const d=await safeFetchJson('/api/approvals/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('approvalDocId').value,decision:'APPROVE'})}); document.getElementById('approvalOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function issueVC(){ try { const d=await safeFetchJson('/api/vc/issue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('vcDocId').value})}); document.getElementById('vcOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function loadSecurityEvents(){ try { const d=await safeFetchJson('/api/security/events'); document.getElementById('riskOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function offlineProof(){ try { const d=await safeFetchJson('/api/offline/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('offlineDocId').value})}); document.getElementById('offlineOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function crossChainProof(){ try { const d=await safeFetchJson('/api/crosschain/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proof:document.getElementById('chainProof').value})}); document.getElementById('chainOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        loadPQC();
-        fetchAllData();
+
             } catch (err) {
                 console.error("Verify failed", err);
             } finally {
@@ -3032,16 +3725,7 @@ DASHBOARD_PAGE = """
             try {
                 await safeFetchJson('/api/locker/add', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
                 document.getElementById('lockerForm').reset();
-                async function loadPQC(){ try { const d=await safeFetchJson('/api/security/pqc'); document.getElementById('pqcStatus').textContent=`${d.mode}${d.warning ? ' — '+d.warning : ' — ready'}`; } catch(e){} }
-        async function makeProof(){ try { const d=await safeFetchJson('/api/zkp/prove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim:document.getElementById('zkClaim').value,secret:document.getElementById('zkSecret').value})}); document.getElementById('zkOut').textContent=JSON.stringify(d.proof,null,2); }catch(e){} }
-        async function grantAccess(){ try { const d=await safeFetchJson('/api/access/grant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('accessDocId').value,minutes:document.getElementById('accessMinutes').value})}); document.getElementById('accessOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function signApproval(){ try { const d=await safeFetchJson('/api/approvals/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('approvalDocId').value,decision:'APPROVE'})}); document.getElementById('approvalOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function issueVC(){ try { const d=await safeFetchJson('/api/vc/issue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('vcDocId').value})}); document.getElementById('vcOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function loadSecurityEvents(){ try { const d=await safeFetchJson('/api/security/events'); document.getElementById('riskOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function offlineProof(){ try { const d=await safeFetchJson('/api/offline/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('offlineDocId').value})}); document.getElementById('offlineOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function crossChainProof(){ try { const d=await safeFetchJson('/api/crosschain/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proof:document.getElementById('chainProof').value})}); document.getElementById('chainOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        loadPQC();
-        fetchAllData();
+
             } catch (err) {
                 console.error("Locker add failed", err);
             }
@@ -3056,20 +3740,68 @@ DASHBOARD_PAGE = """
             } catch (err) { console.error('Redaction failed', err); }
         }
 
-        async function loadPQC(){ try { const d=await safeFetchJson('/api/security/pqc'); document.getElementById('pqcStatus').textContent=`${d.mode}${d.warning ? ' — '+d.warning : ' — ready'}`; } catch(e){} }
-        async function makeProof(){ try { const d=await safeFetchJson('/api/zkp/prove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim:document.getElementById('zkClaim').value,secret:document.getElementById('zkSecret').value})}); document.getElementById('zkOut').textContent=JSON.stringify(d.proof,null,2); }catch(e){} }
-        async function grantAccess(){ try { const d=await safeFetchJson('/api/access/grant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('accessDocId').value,minutes:document.getElementById('accessMinutes').value})}); document.getElementById('accessOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function signApproval(){ try { const d=await safeFetchJson('/api/approvals/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('approvalDocId').value,decision:'APPROVE'})}); document.getElementById('approvalOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function issueVC(){ try { const d=await safeFetchJson('/api/vc/issue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('vcDocId').value})}); document.getElementById('vcOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function loadSecurityEvents(){ try { const d=await safeFetchJson('/api/security/events'); document.getElementById('riskOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function offlineProof(){ try { const d=await safeFetchJson('/api/offline/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:document.getElementById('offlineDocId').value})}); document.getElementById('offlineOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        async function crossChainProof(){ try { const d=await safeFetchJson('/api/crosschain/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proof:document.getElementById('chainProof').value})}); document.getElementById('chainOut').textContent=JSON.stringify(d,null,2); }catch(e){} }
-        loadPQC();
-        fetchAllData();
     
         async function issueEphemeralKey(){try{const docId=document.getElementById('ephemeralDocId').value;const ttl=document.getElementById('ephemeralTtl').value;const d=await safeFetchJson('/api/ephemeral-key/issue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:Number(docId),ttl_seconds:Number(ttl),max_uses:1})});document.getElementById('ephemeralOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('ephemeralOut').textContent=e.message;}}
         async function createHoneyToken(){try{const name=document.getElementById('decoyName').value;const d=await safeFetchJson('/api/honey-token/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decoy_name:name})});document.getElementById('honeyOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('honeyOut').textContent=e.message;}}
         async function bindHardwareToken(){try{const token_id=document.getElementById('hardwareTokenId').value;const proof=document.getElementById('hardwareProof').value;const d=await safeFetchJson('/api/hardware-token/bind',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token_id,proof})});document.getElementById('hardwareOut').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('hardwareOut').textContent=e.message;}}
+        // Dashboard-safe bindings for controls that previously existed only
+        // in the login-page script. Keeping them here makes every tab self-contained.
+        window.runOCR = async function(){
+            const f=document.getElementById('ocrFile')?.files?.[0];
+            if(!f){ window.showUiError('Select a document first.'); return; }
+            const fd=new FormData(); fd.append('file',f); fd.append('language',document.getElementById('ocrLang')?.value||'eng+hin');
+            try{ const d=await safeFetchJson('/api/ocr/parse',{method:'POST',body:fd}); document.getElementById('ocrOut').textContent=JSON.stringify(d,null,2); }
+            catch(e){ document.getElementById('ocrOut').textContent='OCR failed: '+e.message; }
+        };
+        window.loadEnclave = async function(){ try{ const d=await safeFetchJson('/api/security/confidential-computing'); const el=document.getElementById('enclaveStatus'); if(el) el.textContent=`${d.status} — provider: ${d.provider_config}${d.warning?' — '+d.warning:''}`; }catch(e){ window.showUiError(e.message); } };
+        window.loadLockdown = async function(){ try{ const d=await safeFetchJson('/api/security/lockdown'); const el=document.getElementById('lockdownStatus'); if(el) el.textContent=d.lockdown?'LOCKDOWN ACTIVE: '+d.reason:'NORMAL OPERATING MODE'; }catch(e){ window.showUiError(e.message); } };
+        window.toggleLockdown = async function(active){ const reason=document.getElementById('lockReason')?.value||'Emergency security lockdown'; const action=active?'activate':'deactivate'; try{ const d=await safeFetchJson('/api/security/lockdown',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,reason})}); const el=document.getElementById('lockOut'); if(el) el.textContent=JSON.stringify(d,null,2); await window.loadLockdown(); }catch(e){ const el=document.getElementById('lockOut'); if(el) el.textContent=e.message; } };
+        window.makeProof = async function(){ try{ const claim=document.getElementById('zkClaim')?.value.trim(); const secret=document.getElementById('zkSecret')?.value; if(!claim||!secret){ document.getElementById('zkOut').textContent='Enter both a claim and verifier secret.'; return; } const d=await safeFetchJson('/api/zkp/prove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim,secret})}); document.getElementById('zkOut').textContent=JSON.stringify(d.proof||d,null,2); }catch(e){ document.getElementById('zkOut').textContent=e.message; } };
+        window.grantAccess = async function(){ try{ const docId=Number(document.getElementById('accessDocId')?.value); const minutes=Number(document.getElementById('accessMinutes')?.value||30); if(!docId){document.getElementById('accessOut').textContent='Select/enter a valid Document ID.';return;} const d=await safeFetchJson('/api/access/grant',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:docId,minutes})}); document.getElementById('accessOut').textContent=JSON.stringify(d,null,2); }catch(e){document.getElementById('accessOut').textContent=e.message;} };
+        window.signApproval = async function(){ try{ const docId=Number(document.getElementById('approvalDocId')?.value); if(!docId){document.getElementById('approvalOut').textContent='Select/enter a valid Document ID.';return;} const d=await safeFetchJson('/api/approvals/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:docId,decision:'APPROVE'})}); document.getElementById('approvalOut').textContent=JSON.stringify(d,null,2); }catch(e){document.getElementById('approvalOut').textContent=e.message;} };
+        window.issueVC = async function(){ try{ const docId=Number(document.getElementById('vcDocId')?.value); if(!docId){document.getElementById('vcOut').textContent='Select/enter a valid Document ID.';return;} const d=await safeFetchJson('/api/vc/issue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:docId})}); document.getElementById('vcOut').textContent=JSON.stringify(d,null,2); }catch(e){document.getElementById('vcOut').textContent=e.message;} };
+        window.offlineProof = async function(){ try{ const docId=Number(document.getElementById('offlineDocId')?.value); if(!docId){document.getElementById('offlineOut').textContent='Select/enter a valid Document ID.';return;} const d=await safeFetchJson('/api/offline/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:docId})}); document.getElementById('offlineOut').textContent=JSON.stringify(d,null,2); }catch(e){document.getElementById('offlineOut').textContent=e.message;} };
+        window.crossChainProof = async function(){ try{ const proof=document.getElementById('chainProof')?.value.trim(); if(!proof){document.getElementById('chainOut').textContent='Paste a proof bundle first.';return;} const d=await safeFetchJson('/api/crosschain/proof',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proof})}); document.getElementById('chainOut').textContent=JSON.stringify(d,null,2); }catch(e){document.getElementById('chainOut').textContent=e.message;} };
+        window.loadPQC = async function(){ try{ const d=await safeFetchJson('/api/security/pqc'); const el=document.getElementById('pqcStatus'); if(el) el.textContent=`${d.mode||'Provider unavailable'}${d.warning?' — '+d.warning:' — ready'}`; }catch(e){ const el=document.getElementById('pqcStatus'); if(el) el.textContent='Provider unavailable — '+e.message; } };
+        window.loadSecurityEvents = async function(){ try{ const d=await safeFetchJson('/api/security/events'); const el=document.getElementById('riskOut'); if(el) el.textContent=JSON.stringify(d,null,2); }catch(e){ const el=document.getElementById('riskOut'); if(el) el.textContent=e.message; } };
+
+        async function dmsSearch(){
+            try {
+                const p=new URLSearchParams({q:document.getElementById('dmsSearchQ').value||'',case_no:document.getElementById('dmsSearchCase').value||'',doc_type:document.getElementById('dmsSearchType').value||''});
+                const d=await safeFetchJson('/api/dms/search?'+p.toString());
+                const box=document.getElementById('dmsSearchOut');
+                box.innerHTML=d.results.length?d.results.map(x=>`<div style="padding:8px;border-bottom:1px solid var(--border-color);font-size:11px"><b>#${x.id} ${x.title||x.original_filename}</b> · ${x.doc_type} · ${x.case_no} · v${x.version}<br><span class="mono">SHA-256: ${x.file_hash}</span><br><button type="button" class="btn-primary btn-blue" onclick="showDmsVersions(${x.id})">Versions</button> <button type="button" class="btn-primary btn-emerald" onclick="downloadDmsDoc(${x.id})">Retrieve</button></div>`).join(''):'<div style="padding:8px;color:var(--text-muted)">No authorized documents found.</div>';
+            } catch(e) { document.getElementById('dmsSearchOut').textContent=e.message; }
+        }
+        async function createDmsVersion(){
+            const file=document.getElementById('versionFile').files[0]; const docId=document.getElementById('versionDocId').value;
+            if(!file||!docId){alert('Parent document ID and a new version file are required.');return;}
+            const fd=new FormData(); fd.append('file',file); fd.append('doc_id',docId); fd.append('change_note',document.getElementById('versionNote').value||'Updated legal/investigation document');
+            try { const d=await safeFetchJson('/api/dms/version',{method:'POST',body:fd}); document.getElementById('versionOut').textContent=JSON.stringify(d,null,2); dmsSearch(); } catch(e){document.getElementById('versionOut').textContent=e.message;}
+        }
+        async function showDmsVersions(docId){
+            try { const d=await safeFetchJson('/api/dms/versions/'+docId); document.getElementById('versionOut').textContent=JSON.stringify(d,null,2); } catch(e){document.getElementById('versionOut').textContent=e.message;}
+        }
+        async function grantDmsAccess(){
+            try { const d=await safeFetchJson('/api/dms/access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:Number(document.getElementById('collabDocId').value),username:document.getElementById('collabUser').value,role:document.getElementById('collabRole').value,permission:document.getElementById('collabPerm').value})}); document.getElementById('collabOut').textContent=JSON.stringify(d,null,2); } catch(e){document.getElementById('collabOut').textContent=e.message;}
+        }
+        async function postDmsMessage(){
+            try { const d=await safeFetchJson('/api/dms/collaboration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_id:Number(document.getElementById('collabDocId').value),message:document.getElementById('collabMessage').value})}); document.getElementById('collabOut').textContent=JSON.stringify(d,null,2); document.getElementById('collabMessage').value=''; } catch(e){document.getElementById('collabOut').textContent=e.message;}
+        }
+        async function loadDmsMessages(){
+            try { const d=await safeFetchJson('/api/dms/collaboration/'+Number(document.getElementById('collabDocId').value)); document.getElementById('collabOut').textContent=JSON.stringify(d,null,2); } catch(e){document.getElementById('collabOut').textContent=e.message;}
+        }
+        async function downloadDmsDoc(docId){ window.open('/api/dms/document/'+docId+'/download','_blank','noopener'); }
+
+
+        // Final boot: populate the ledger and all read-only control cards on first load.
+        async function bootDashboardFinal(){
+            const tasks=[fetchAllData, window.loadBlockchain, window.loadPQC, window.loadEnclave, window.loadLockdown, window.loadAIMode, window.loadResidency, window.loadSecurityEvents];
+            for(const fn of tasks){ if(typeof fn!=='function') continue; try{ await fn(); }catch(e){ console.warn('Feature bootstrap failed',e); } }
+        }
+        if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', bootDashboardFinal, {once:true});
+        else bootDashboardFinal();
+
 </script>
 </body>
 </html>
@@ -3188,6 +3920,7 @@ CERTIFICATE_TEMPLATE = """
             <tr><th>Hardware Node IP / Identifier</th><td>127.0.0.1 (Courtroom Verified Terminal Node)</td></tr>
             <tr><th>Hardware MAC Signature</th><td>02:42:AC:11:00:02 (Local System Identifier)</td></tr>
             <tr><th>Admissibility Status</th><td><b style="color: #059669;">HASH VERIFIED AGAINST REGISTERED BASELINE</b></td></tr>
+            <tr><th>Blockchain Evidence Anchor</th><td><b style="color:#059669;">Cryptographic ledger anchoring enabled</b></td></tr>
         </table>
 
         <p style="margin-top: 25px;">
@@ -3226,20 +3959,41 @@ def home():
 @app.route("/login", methods=["GET", "POST"])
 def login_view():
     if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
+        # Browser form values can contain accidental leading/trailing spaces.
+        # Normalize only the username; passwords remain exact.
+        username = (request.form.get("username") or "").strip().lower()
+        password = request.form.get("password") or ""
+        ip = _client_ip()
+        now_mono = time.monotonic()
+        with _login_guard_lock:
+            attempts = _login_attempts[ip]
+            while attempts and now_mono - attempts[0] > LOGIN_WINDOW_SECONDS:
+                attempts.popleft()
+            if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+                _security_event("anonymous", "LOGIN_RATE_LIMIT", 80, {"ip": ip})
+                return render_template_string(LOGIN_PAGE, error="Too many failed attempts. Please wait a moment and try again."), 429
 
         conn = get_db()
-        user = conn.cursor().execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        user = conn.cursor().execute(
+            "SELECT * FROM users WHERE LOWER(username) = ?",
+            (username,)
+        ).fetchone()
         conn.close()
 
         if user and check_password_hash(user["password_hash"], password):
+            with _login_guard_lock:
+                _login_attempts.pop(ip, None)
+            session.clear()
+            session.permanent = True
+            session["csrf_token"] = secrets.token_urlsafe(32)
             session["user"] = {
                 "id": user["id"],
                 "username": user["username"],
                 "role": user["role"]
             }
             return redirect(url_for("dashboard_view"))
+        with _login_guard_lock:
+            _login_attempts[ip].append(now_mono)
         circuit_breaker_hit("failed_login",threshold=5,window_seconds=120,freeze_seconds=180,reason="repeated login failure")
         return render_template_string(LOGIN_PAGE, error="Invalid Authorized ID or Passkey!")
     return render_template_string(LOGIN_PAGE)
@@ -3254,7 +4008,33 @@ def logout_view():
 @app.route("/dashboard")
 @login_required
 def dashboard_view():
-    return render_template_string(DASHBOARD_PAGE)
+    return render_template_string(DASHBOARD_PAGE, document_types=DOCUMENT_TYPES, csrf_token=_csrf_token())
+
+
+def _atomic_save_upload(file_storage, destination, aad):
+    """Reads the upload fully, encrypts it (AES-256-GCM) and writes the
+    ciphertext atomically so a partial/crashed write never becomes the
+    registered evidence file. The plaintext bytes are never persisted to disk.
+    Returns (bytes_written, raw_plaintext_bytes, enc_nonce_b64) so the caller
+    can still run OCR/hashing on the plaintext in memory before it goes out
+    of scope."""
+    file_storage.stream.seek(0)
+    raw = file_storage.stream.read()
+    if len(raw) > app.config["MAX_CONTENT_LENGTH"]:
+        raise ValueError("upload exceeds configured size limit")
+    nonce_b64, ciphertext = encrypt_document_bytes(raw, aad)
+    _atomic_write_ciphertext(ciphertext, destination)
+    return len(raw), raw, nonce_b64
+
+
+def _validate_upload_filename(filename):
+    safe = secure_filename(filename or "")
+    if not safe:
+        return None, "invalid_filename"
+    ext = os.path.splitext(safe)[1].lower()
+    if ext in BLOCKED_UPLOAD_EXTENSIONS:
+        return None, "executable_file_type_blocked"
+    return safe, None
 
 
 @app.route("/upload", methods=["POST"])
@@ -3265,13 +4045,17 @@ def upload():
     if not file or file.filename == "":
         return jsonify({"error": "No file"}), 400
 
-    filename = secure_filename(file.filename)
-    if not filename:
-        return jsonify({"error": "invalid_filename", "message": "The uploaded filename is invalid."}), 400
+    filename, filename_error = _validate_upload_filename(file.filename)
+    if filename_error:
+        _security_event(session["user"]["username"], "UPLOAD_REJECTED", 45, {"reason": filename_error, "filename": str(file.filename)[:200]})
+        return jsonify({"error": filename_error, "message": "This file type or filename is not permitted for secure evidence storage."}), 400
 
     doc_uuid = str(uuid.uuid4())
     stored_filename = f"{doc_uuid}_{filename}"
-    case_no = f"CR-2026/{uuid.uuid4().hex[:4].upper()}"
+    case_no = str(request.form.get("case_no", "")).strip()[:80] or f"CR-2026/{uuid.uuid4().hex[:4].upper()}"
+    title = str(request.form.get("title", "")).strip()[:200] or os.path.splitext(filename)[0]
+    requested_doc_type = str(request.form.get("doc_type", "")).strip()
+    doc_type = requested_doc_type if requested_doc_type in DOCUMENT_TYPES else ""
 
     requested_region = str(request.headers.get("X-Data-Region", os.getenv("DATA_RESIDENCY_REGION", "IN"))).upper()[:20]
     ok_region, expected_region = residency_guard(requested_region)
@@ -3279,15 +4063,19 @@ def upload():
         return jsonify({"error":"data_residency_violation","message":f"This node accepts evidence only for region {expected_region}.","expected_region":expected_region}), 403
     file_hash = calculate_sha256(file.stream)
     destination = os.path.join(UPLOAD_FOLDER, stored_filename)
-    file.save(destination)
+    try:
+        uploaded_bytes, raw_plaintext, enc_nonce_b64 = _atomic_save_upload(file, destination, doc_uuid)
+    except Exception as exc:
+        _security_event(session["user"]["username"], "UPLOAD_WRITE_FAILED", 75, {"filename": filename, "error": str(exc)[:200]})
+        return jsonify({"error": "secure_write_failed", "message": "The evidence file could not be stored safely. Please try again."}), 500
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO documents (doc_uuid, case_no, original_filename, stored_filename, file_hash, uploaded_by, role, timestamp, storage_region, retention_until, data_class)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (doc_uuid, case_no, filename, stored_filename, file_hash, session["user"]["username"], session["user"]["role"], now, expected_region, (datetime.now()+timedelta(days=int(os.getenv("EVIDENCE_RETENTION_DAYS","3650")))).strftime("%Y-%m-%d %H:%M:%S"), "evidence"))
+        INSERT INTO documents (doc_uuid, case_no, title, doc_type, version, previous_version_id, original_filename, stored_filename, file_hash, uploaded_by, role, timestamp, storage_region, retention_until, data_class, enc_nonce)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (doc_uuid, case_no, title, doc_type or "Evidence Record", 1, None, filename, stored_filename, file_hash, session["user"]["username"], session["user"]["role"], now, expected_region, (datetime.now()+timedelta(days=int(os.getenv("EVIDENCE_RETENTION_DAYS","3650")))).strftime("%Y-%m-%d %H:%M:%S"), "evidence", enc_nonce_b64))
 
     cursor.execute("""
         INSERT INTO audit_logs (filename, case_no, action, status, username, role, timestamp)
@@ -3300,15 +4088,41 @@ def upload():
     conn.commit()
     conn.close()
 
-    # Automatically extract text after sealing the evidence so LawGPT has
+    blockchain_anchor = add_blockchain_block(
+        "DOCUMENT_SEALED", doc_id=doc_id, case_no=case_no, document_hash=file_hash,
+        payload={"filename": filename, "title": title, "doc_type": doc_type or "Evidence Record", "storage_region": expected_region, "version": 1}
+    )
+
+    # Automatically extract text after sealing the evidence so Case Intelligence has
     # context immediately after upload. OCR/parser failures must NOT block
     # evidence ingestion: the original binary + SHA-256 remain authoritative.
     extracted_text = ""
     extraction_engine = "none"
     parser = {}
     extraction_warning = ""
+    # OCR/text extraction needs a plaintext file on disk (pytesseract/PyMuPDF read
+    # by path). The stored evidence file is ciphertext, so we materialize a
+    # short-lived plaintext temp copy for extraction only, then remove it
+    # immediately — it is never left on disk.
+    ocr_temp_path = os.path.join(UPLOAD_FOLDER, ".plain_" + secrets.token_hex(12) + "_" + filename)
     try:
-        extracted_text, extraction_engine = extract_text_from_document(destination, filename, "eng+hin")
+        with open(ocr_temp_path, "wb") as f:
+            f.write(raw_plaintext)
+        extracted_text, extraction_engine = extract_text_from_document(ocr_temp_path, filename, "eng+hin")
+        if not doc_type:
+            blob = (filename + " " + extracted_text[:4000]).lower()
+            rules = [
+                ("FIR / Police Report", ["first information report", " fir ", "police report"]),
+                ("Charge Sheet", ["charge sheet", "chargesheet"]),
+                ("Witness Statement", ["witness statement", "statement of witness"]),
+                ("Court Filing", ["court filing", "petition", "in the court of"]),
+                ("Forensic Report", ["forensic", "fsl report", "ballistic"]),
+                ("Legal Notice", ["legal notice"]),
+                ("Judgment", ["judgment", "judgement", "order of the court"]),
+                ("Evidence Record", ["evidence", "seizure", "malkhana"]),
+                ("Investigation Record", ["investigation", "case diary"]),
+            ]
+            doc_type = next((t for t, keys in rules if any(k in blob for k in keys)), "Other")
         if extracted_text.strip():
             parser = legal_parser(extracted_text)
             text_hash = hashlib.sha256(extracted_text.encode("utf-8")).hexdigest()
@@ -3323,10 +4137,17 @@ def upload():
     except Exception as exc:
         extraction_warning = str(exc)[:300]
         extraction_engine = "unavailable"
+    finally:
+        try:
+            if os.path.exists(ocr_temp_path):
+                os.remove(ocr_temp_path)
+        except OSError:
+            pass
+        raw_plaintext = None  # drop the in-memory plaintext reference once we're done with it
 
     _security_event(session["user"]["username"], "DOCUMENT_INGEST", 3, {
         "filename": filename,
-        "size_bytes": os.path.getsize(destination),
+        "size_bytes": uploaded_bytes,
         "case_no": case_no,
         "text_extraction": extraction_engine
     })
@@ -3340,7 +4161,10 @@ def upload():
         "extracted_text": extracted_text[:2_000_000],
         "extraction_engine": extraction_engine,
         "legal_parser": parser,
-        "extraction_warning": extraction_warning
+        "extraction_warning": extraction_warning,
+        "document_type": doc_type or "Evidence Record",
+        "title": title,
+        "blockchain": blockchain_anchor
     })
 
 
@@ -3372,7 +4196,7 @@ def verify():
         baseline_filename = hash_match["original_filename"]
         orig_time = hash_match["timestamp"]
         case_no = hash_match["case_no"]
-        # Rehydrate the extracted evidence text so LawGPT continues to work
+        # Rehydrate the extracted evidence text so Case Intelligence continues to work
         # after a fresh verify/reload, without trusting browser-only state.
         ocr_row = cursor.execute(
             "SELECT extracted_text FROM ocr_results WHERE doc_id=? ORDER BY id DESC LIMIT 1",
@@ -3398,13 +4222,11 @@ def verify():
             baseline_filename = row["original_filename"]
             case_no = row["case_no"]
             try:
-                original_path = os.path.join(UPLOAD_FOLDER, row["stored_filename"])
                 file.stream.seek(0)
                 current_bytes = file.stream.read()
                 file.stream.seek(0)
 
-                with open(original_path, "rb") as orig_f:
-                    orig_bytes = orig_f.read()
+                orig_bytes = read_document_plaintext(row)
 
                 # Only run line-by-line diffing on reasonably sized text files.
                 # Decoding arbitrary binary files and building a full difflib list can
@@ -3458,6 +4280,11 @@ def verify():
     conn.close()
     risk = 45 if status == "TAMPER_ALERT" else 2
     _security_event(session["user"]["username"], "INTEGRITY_VERIFY", risk, {"filename": filename, "status": status, "case_no": case_no})
+    verification_anchor = add_blockchain_block(
+        "INTEGRITY_VERIFICATION", doc_id=(hash_match["id"] if hash_match else (row["id"] if row else None)),
+        case_no=case_no, document_hash=current_hash,
+        payload={"status": status, "verified_filename": filename, "verified_by": session["user"]["username"]}
+    )
 
     return jsonify({
         "status": status,
@@ -3469,7 +4296,8 @@ def verify():
         "verify_time": now,
         "baseline_filename": baseline_filename,
         "current_filename": filename,
-        "case_no": case_no
+        "case_no": case_no,
+        "blockchain": verification_anchor
     })
 
 
@@ -3489,11 +4317,15 @@ def api_ai_chat():
     state=ai_agent_mode("LawGPT")
     response={"reply": reply, "agent": "LawGPT", "mode": state.get("mode","ACTIVE"), "poisoning_guard": poison}
     if state.get("mode")=="RETIRED":
-        response.update({"tombstone":True,"replacement":"LawGPT-ReadOnly","status":"RETIRED"})
+        response.update({"tombstone":True,"replacement":"Case Intelligence-ReadOnly","status":"RETIRED"})
     elif state.get("mode")=="SAFE_READ_ONLY":
         response.update({"tombstone":False,"status":"SAFE_READ_ONLY","action_execution":False,"note":"AI is restricted to analysis/recommendations; it cannot execute system actions."})
     return jsonify(response)
 
+
+@app.route("/api/security/csrf", methods=["GET"])
+def api_csrf():
+    return jsonify({"csrf_token": _csrf_token()})
 
 @app.route("/api/security/pqc", methods=["GET"])
 @api_login_required
@@ -3812,7 +4644,7 @@ def api_ai_mode():
 @operational_required
 def api_kill_propagate():
     if session["user"]["role"]!="Court Administrator": return jsonify({"error":"administrator_required"}),403
-    data=request.get_json(silent=True) or {}; scope=str(data.get("scope","agent")); target=str(data.get("target","LawGPT")); reason=str(data.get("reason","security response")); return jsonify(propagate_kill_switch(scope,target,reason))
+    data=request.get_json(silent=True) or {}; scope=str(data.get("scope","agent")); target=str(data.get("target","Case Intelligence")); reason=str(data.get("reason","security response")); return jsonify(propagate_kill_switch(scope,target,reason))
 
 @app.route("/api/forensic/snapshots")
 @api_login_required
@@ -3835,7 +4667,7 @@ def api_security_redteam():
     if session["user"]["role"] != "Court Administrator":
         return jsonify({"error":"administrator_required"}),403
     data=request.get_json(silent=True) or {}
-    agent=str(data.get("agent","LawGPT"))[:100]
+    agent=str(data.get("agent","Case Intelligence"))[:100]
     target=str(data.get("target_text",""))[:20000]
     result=agentic_redteam_defense(agent,target)
     run_id="RT-"+uuid.uuid4().hex
@@ -3991,6 +4823,20 @@ def api_hardware_status():
     conn=get_db(); rows=[dict(r) for r in conn.execute("SELECT token_id,token_hash,created_at,last_verified_at,status FROM hardware_token_bindings WHERE username=? ORDER BY id DESC",(session["user"]["username"],))]; conn.close()
     return jsonify({"bindings":rows,"note":"For real hardware-backed identity, integrate WebAuthn/FIDO2 and validate authenticator attestation server-side."})
 
+@app.route("/api/blockchain/status")
+@api_login_required
+def blockchain_status():
+    return jsonify({"chain": verify_blockchain(), "blocks": latest_blockchain_blocks(20), "model":"permissioned_local_sha256_ledger"})
+
+
+@app.route("/api/blockchain/verify")
+@api_login_required
+def blockchain_verify():
+    result = verify_blockchain()
+    _security_event(session["user"]["username"], "BLOCKCHAIN_VERIFY", 5 if result["valid"] else 80, result)
+    return jsonify(result)
+
+
 @app.route("/certificate/<filename>")
 @login_required
 def generate_certificate(filename):
@@ -4028,6 +4874,250 @@ def add_locker_item():
     return jsonify({"status": "success"})
 
 
+# ---------------- 26190 CORE DMS ALIGNMENT: SEARCH / VERSIONING / COLLABORATION ---------------- #
+DMS_PERMISSIONS = {"READ", "COMMENT", "SHARE", "WRITE"}
+DMS_ROLES = {"Police Inspector", "Presiding Judge", "Court Administrator", "Forensic Officer", "Legal Officer", "Investigating Officer"}
+
+
+def _doc_acl_allows(doc_id, permission="READ", username=None, role=None):
+    """Owner/admin or an explicit active ACL grant may access a document."""
+    username = username or session.get("user", {}).get("username", "")
+    role = role or session.get("user", {}).get("role", "")
+    conn = get_db()
+    doc = conn.execute("SELECT uploaded_by, role FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if not doc:
+        conn.close()
+        return False
+    if username == doc["uploaded_by"] or role == "Court Administrator":
+        conn.close()
+        return True
+    rows = conn.execute("""
+        SELECT permission, expires_at FROM document_acl
+        WHERE doc_id=? AND revoked=0
+          AND (grantee_username=? OR (grantee_username IS NULL AND grantee_role=?))
+    """, (doc_id, username, role)).fetchall()
+    conn.close()
+    now = datetime.now()
+    allowed = set()
+    for r in rows:
+        if r["expires_at"]:
+            try:
+                if datetime.strptime(r["expires_at"], "%Y-%m-%d %H:%M:%S") < now:
+                    continue
+            except ValueError:
+                continue
+        allowed.add(r["permission"])
+    if permission == "READ":
+        return bool(allowed & {"READ", "COMMENT", "SHARE", "WRITE"})
+    if permission == "COMMENT":
+        return bool(allowed & {"COMMENT", "SHARE", "WRITE"})
+    if permission == "SHARE":
+        return bool(allowed & {"SHARE", "WRITE"})
+    return "WRITE" in allowed
+
+
+def _visible_document_where(username, role):
+    """SQL predicate for confidentiality-aware listing/search."""
+    if role == "Court Administrator":
+        return "1=1", []
+    return "(d.uploaded_by=? OR EXISTS (SELECT 1 FROM document_acl a WHERE a.doc_id=d.id AND a.revoked=0 AND (a.grantee_username=? OR (a.grantee_username IS NULL AND a.grantee_role=?))))", [username, username, role]
+
+
+@app.route("/api/dms/search")
+@api_login_required
+def dms_search():
+    username = session["user"]["username"]
+    role = session["user"]["role"]
+    q = str(request.args.get("q", "")).strip()[:200]
+    case_no = str(request.args.get("case_no", "")).strip()[:100]
+    doc_type = str(request.args.get("doc_type", "")).strip()[:100]
+    limit = max(1, min(50, int(request.args.get("limit", "50") or 50)))
+    where, params = _visible_document_where(username, role)
+    clauses = [where]
+    if q:
+        like = f"%{q}%"
+        clauses.append("(d.title LIKE ? OR d.original_filename LIKE ? OR d.case_no LIKE ? OR d.doc_type LIKE ? OR EXISTS (SELECT 1 FROM ocr_results o WHERE o.doc_id=d.id AND o.extracted_text LIKE ?))")
+        params += [like, like, like, like, like]
+    if case_no:
+        clauses.append("d.case_no LIKE ?")
+        params.append(f"%{case_no}%")
+    if doc_type:
+        clauses.append("d.doc_type=?")
+        params.append(doc_type)
+    conn = get_db()
+    rows = conn.execute(f"SELECT d.id,d.doc_uuid,d.case_no,d.title,d.doc_type,d.version,d.previous_version_id,d.original_filename,d.file_hash,d.uploaded_by,d.role,d.timestamp,d.storage_region FROM documents d WHERE {' AND '.join(clauses)} ORDER BY d.id DESC LIMIT ?", params + [limit]).fetchall()
+    conn.close()
+    _security_event(username, "DMS_SEARCH", 2, {"q": q, "case_no": case_no, "doc_type": doc_type, "results": len(rows)})
+    return jsonify({"results": [dict(r) for r in rows], "count": len(rows)})
+
+
+@app.route("/api/dms/access", methods=["POST"])
+@api_login_required
+@operational_required
+def dms_grant_access():
+    data = request.get_json(silent=True) or {}
+    doc_id = int(data.get("doc_id", 0) or 0)
+    username = str(data.get("username", "")).strip().lower()[:80] or None
+    role = str(data.get("role", "")).strip()[:100] or None
+    permission = str(data.get("permission", "READ")).upper().strip()
+    if not doc_id or permission not in DMS_PERMISSIONS or (not username and not role) or (role and role not in DMS_ROLES):
+        return jsonify({"error":"invalid_request","message":"Document ID, a valid officer/role, and permission are required."}), 400
+    if not _doc_acl_allows(doc_id, "SHARE"):
+        return jsonify({"error":"forbidden","message":"Only the document owner, administrator, or an authorized SHARE/WRITE stakeholder may grant access."}), 403
+    conn = get_db()
+    exists = conn.execute("SELECT id FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if not exists:
+        conn.close(); return jsonify({"error":"document_not_found"}), 404
+    conn.execute("INSERT OR REPLACE INTO document_acl(doc_id,grantee_username,grantee_role,permission,granted_by,created_at,revoked) VALUES(?,?,?,?,?,?,0)", (doc_id, username, role, permission, session["user"]["username"], _now()))
+    conn.commit(); conn.close()
+    add_blockchain_block("ACCESS_GRANT", doc_id=doc_id, payload={"grantee_username":username,"grantee_role":role,"permission":permission,"granted_by":session["user"]["username"]})
+    _security_event(session["user"]["username"], "DMS_ACCESS_GRANTED", 8, {"doc_id":doc_id,"permission":permission,"username":username,"role":role})
+    return jsonify({"status":"granted","doc_id":doc_id,"permission":permission,"username":username,"role":role})
+
+
+@app.route("/api/dms/versions/<int:doc_id>")
+@api_login_required
+def dms_versions(doc_id):
+    if not _doc_acl_allows(doc_id, "READ"):
+        return jsonify({"error":"forbidden"}), 403
+    conn = get_db()
+    root = conn.execute("SELECT id,case_no,title,doc_type,version,file_hash,uploaded_by,timestamp FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if not root:
+        conn.close(); return jsonify({"error":"document_not_found"}), 404
+    # Walk back through the immutable parent links and include descendants.
+    root_id = root["id"]
+    while True:
+        parent = conn.execute("SELECT previous_version_id FROM documents WHERE id=?", (root_id,)).fetchone()
+        if not parent or not parent["previous_version_id"]: break
+        root_id = parent["previous_version_id"]
+    rows = conn.execute("SELECT id,version,case_no,title,doc_type,file_hash,uploaded_by,timestamp,previous_version_id FROM documents WHERE id=? OR previous_version_id=? ORDER BY version ASC,id ASC", (root_id, root_id)).fetchall()
+    # Include deeper descendants too (older SQLite builds may only have one-level links).
+    seen = {r["id"] for r in rows}; changed = True
+    while changed:
+        changed=False
+        for r in list(rows):
+            kids=conn.execute("SELECT id,version,case_no,title,doc_type,file_hash,uploaded_by,timestamp,previous_version_id FROM documents WHERE previous_version_id=? ORDER BY version ASC,id ASC",(r["id"],)).fetchall()
+            for k in kids:
+                if k["id"] not in seen: rows.append(k); seen.add(k["id"]); changed=True
+    conn.close()
+    rows = sorted(rows, key=lambda r:(r["version"] or 1, r["id"]))
+    return jsonify({"root_doc_id":root_id,"versions":[dict(r) for r in rows]})
+
+
+@app.route("/api/dms/version", methods=["POST"])
+@api_login_required
+@operational_required
+def dms_create_version():
+    parent_id = int(request.form.get("doc_id", 0) or 0)
+    note = str(request.form.get("change_note", "")).strip()[:500]
+    file = request.files.get("file")
+    if not parent_id or not file or not file.filename:
+        return jsonify({"error":"invalid_request","message":"Parent document ID and a new version file are required."}), 400
+    if not _doc_acl_allows(parent_id, "WRITE"):
+        return jsonify({"error":"forbidden","message":"WRITE permission is required to create a document version."}), 403
+    filename, filename_error = _validate_upload_filename(file.filename)
+    if filename_error:
+        return jsonify({"error":filename_error,"message":"This file type or filename is not permitted."}), 400
+    conn = get_db()
+    parent = conn.execute("SELECT * FROM documents WHERE id=?", (parent_id,)).fetchone()
+    if not parent:
+        conn.close(); return jsonify({"error":"document_not_found"}), 404
+    # Version number is serialized inside the SQLite write transaction.
+    maxv = conn.execute("SELECT COALESCE(MAX(version),0) FROM documents WHERE case_no=? AND title=?", (parent["case_no"], parent["title"])).fetchone()[0]
+    new_version = int(maxv) + 1
+    file_hash = calculate_sha256(file.stream)
+    doc_uuid = str(uuid.uuid4())
+    stored_filename = f"{doc_uuid}_{filename}"
+    destination = os.path.join(UPLOAD_FOLDER, stored_filename)
+    try:
+        _, _, enc_nonce_b64 = _atomic_save_upload(file, destination, doc_uuid)
+        now = _now()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO documents (doc_uuid,case_no,title,doc_type,version,previous_version_id,original_filename,stored_filename,file_hash,uploaded_by,role,timestamp,storage_region,retention_until,data_class,enc_nonce) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (doc_uuid,parent["case_no"],parent["title"],parent["doc_type"],new_version,parent_id,filename,stored_filename,file_hash,session["user"]["username"],session["user"]["role"],now,parent["storage_region"],parent["retention_until"],parent["data_class"],enc_nonce_b64))
+        new_id = cur.lastrowid
+        conn.execute("INSERT INTO document_versions(root_doc_id,parent_doc_id,version_doc_id,version_no,previous_hash,current_hash,change_note,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (parent_id,parent_id,new_id,new_version,parent["file_hash"],file_hash,note,session["user"]["username"],now))
+        conn.execute("INSERT INTO audit_logs(filename,case_no,action,status,username,role,timestamp) VALUES(?,?,?,?,?,?,?)", (filename,parent["case_no"],"DOCUMENT_VERSION_CREATED", "SECURED", session["user"]["username"],session["user"]["role"],now))
+        # Carry forward active ACL grants so collaboration permissions remain valid across versions.
+        conn.execute("INSERT INTO document_acl(doc_id,grantee_username,grantee_role,permission,granted_by,created_at,expires_at,revoked) SELECT ?,grantee_username,grantee_role,permission,granted_by,created_at,expires_at,revoked FROM document_acl WHERE doc_id=? AND revoked=0", (new_id,parent_id))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        try:
+            if os.path.exists(destination): os.remove(destination)
+        except OSError: pass
+        conn.close()
+        _security_event(session["user"]["username"], "VERSION_CREATE_FAILED", 70, {"doc_id":parent_id,"error":str(exc)[:200]})
+        return jsonify({"error":"version_create_failed","message":"The new version could not be committed."}), 500
+    conn.close()
+    anchor = add_blockchain_block("DOCUMENT_VERSION", doc_id=new_id, case_no=parent["case_no"], document_hash=file_hash, payload={"parent_doc_id":parent_id,"version":new_version,"previous_hash":parent["file_hash"],"change_note":note})
+    conn = get_db(); conn.execute("UPDATE document_versions SET blockchain_block_index=? WHERE version_doc_id=?", (anchor["block_index"],new_id)); conn.commit(); conn.close()
+    _security_event(session["user"]["username"], "DOCUMENT_VERSION_CREATED", 5, {"parent_doc_id":parent_id,"version_doc_id":new_id,"version":new_version})
+    return jsonify({"status":"version_created","doc_id":new_id,"parent_doc_id":parent_id,"version":new_version,"sha256":file_hash,"blockchain":anchor})
+
+
+@app.route("/api/dms/collaboration", methods=["POST"])
+@api_login_required
+@operational_required
+def dms_collaboration_post():
+    data = request.get_json(silent=True) or {}
+    doc_id = int(data.get("doc_id",0) or 0)
+    message = str(data.get("message","")).strip()[:2000]
+    if not doc_id or not message:
+        return jsonify({"error":"invalid_request","message":"Document ID and message are required."}),400
+    if not _doc_acl_allows(doc_id,"COMMENT"):
+        return jsonify({"error":"forbidden","message":"COMMENT permission is required for case collaboration."}),403
+    conn=get_db(); doc=conn.execute("SELECT case_no FROM documents WHERE id=?",(doc_id,)).fetchone()
+    if not doc: conn.close(); return jsonify({"error":"document_not_found"}),404
+    now=_now(); conn.execute("INSERT INTO collaboration_messages(doc_id,case_no,author,author_role,message,created_at) VALUES(?,?,?,?,?,?)",(doc_id,doc["case_no"],session["user"]["username"],session["user"]["role"],message,now)); conn.commit(); conn.close()
+    add_blockchain_block("COLLABORATION_NOTE",doc_id=doc_id,case_no=doc["case_no"],payload={"author":session["user"]["username"],"role":session["user"]["role"],"message_hash":hashlib.sha256(message.encode()).hexdigest()})
+    _security_event(session["user"]["username"],"COLLABORATION_NOTE",3,{"doc_id":doc_id,"case_no":doc["case_no"]})
+    return jsonify({"status":"posted","doc_id":doc_id,"created_at":now})
+
+
+@app.route("/api/dms/collaboration/<int:doc_id>")
+@api_login_required
+def dms_collaboration_get(doc_id):
+    if not _doc_acl_allows(doc_id,"READ"):
+        return jsonify({"error":"forbidden"}),403
+    conn=get_db(); rows=conn.execute("SELECT id,case_no,author,author_role,message,created_at FROM collaboration_messages WHERE doc_id=? ORDER BY id DESC LIMIT 100",(doc_id,)).fetchall(); conn.close()
+    return jsonify({"doc_id":doc_id,"messages":[dict(r) for r in rows]})
+
+
+@app.route("/api/dms/document/<int:doc_id>/download")
+@api_login_required
+def dms_document_download(doc_id):
+    if not _doc_acl_allows(doc_id,"READ"):
+        _security_event(session["user"]["username"],"DOCUMENT_RETRIEVAL_DENIED",35,{"doc_id":doc_id})
+        return jsonify({"error":"forbidden","message":"You are not authorized to retrieve this document."}),403
+    conn=get_db(); doc=conn.execute("SELECT doc_uuid,original_filename,stored_filename,case_no,file_hash,enc_nonce FROM documents WHERE id=?",(doc_id,)).fetchone(); conn.close()
+    if not doc: return jsonify({"error":"document_not_found"}),404
+    try:
+        plaintext = read_document_plaintext(doc)
+    except Exception:
+        _security_event(session["user"]["username"],"DOCUMENT_DECRYPT_FAILED",80,{"doc_id":doc_id,"case_no":doc["case_no"]})
+        return jsonify({"error":"decryption_failed","message":"The evidence file could not be decrypted. It may have been tampered with."}),500
+    _security_event(session["user"]["username"],"DOCUMENT_RETRIEVED",5,{"doc_id":doc_id,"case_no":doc["case_no"],"sha256":doc["file_hash"]})
+    mime_type = mimetypes.guess_type(doc["original_filename"])[0] or "application/octet-stream"
+    response = Response(plaintext, mimetype=mime_type)
+    response.headers["Content-Disposition"] = f'attachment; filename="{secure_filename(doc["original_filename"])}"'
+    return response
+
+
+@app.route("/api/blockchain/document/<int:doc_id>")
+@api_login_required
+def dms_blockchain_document(doc_id):
+    if not _doc_acl_allows(doc_id,"READ"):
+        return jsonify({"error":"forbidden"}),403
+    conn=get_db(); rows=conn.execute("SELECT * FROM blockchain_blocks WHERE doc_id=? ORDER BY block_index ASC",(doc_id,)).fetchall(); conn.close()
+    return jsonify({"doc_id":doc_id,"chain_valid":verify_blockchain().get("valid",False),"blocks":[dict(r) for r in rows],"ledger":"permissioned_local_sha256_chain"})
+
+
+@app.route("/api/session/csrf")
+@api_login_required
+def session_csrf():
+    return jsonify({"csrf_token": _csrf_token()})
+
+
 @app.route("/api/all_data")
 @api_login_required
 def all_data():
@@ -4037,7 +5127,8 @@ def all_data():
     cursor.execute("SELECT COUNT(*) FROM documents")
     total_docs = cursor.fetchone()[0]
 
-    cursor.execute("SELECT * FROM documents ORDER BY id DESC LIMIT 100")
+    where, params = _visible_document_where(session["user"]["username"], session["user"]["role"])
+    cursor.execute(f"SELECT * FROM documents d WHERE {where} ORDER BY d.id DESC LIMIT 100", params)
     documents = [dict(r) for r in cursor.fetchall()]
 
     cursor.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 15")
@@ -4051,8 +5142,24 @@ def all_data():
         "total_docs": total_docs,
         "documents": documents,
         "audit_logs": audit_logs,
-        "locker": locker
+        "locker": locker,
+        "blockchain": verify_blockchain(),
+        "blockchain_blocks": latest_blockchain_blocks(12),
+        "dms_core": {"search": "/api/dms/search", "versioning": "/api/dms/version", "collaboration": "/api/dms/collaboration"}
     })
+
+
+@app.route("/healthz")
+def healthz():
+    """Lightweight process health endpoint for local/cloud/container runners."""
+    try:
+        conn = get_db()
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        conn.close()
+        ok = bool(row and row[0] == "ok")
+    except Exception:
+        ok = False
+    return jsonify({"status": "ok" if ok else "degraded", "service": "sdems", "python": platform.python_version(), "platform": platform.system()}), (200 if ok else 503)
 
 
 @app.errorhandler(404)
@@ -4068,6 +5175,17 @@ def handle_413(e):
     return jsonify({"error": "file_too_large", "message": "File exceeds the 50MB upload limit."}), 413
 
 
+@app.errorhandler(OverflowError)
+def handle_overflow(e):
+    # Flask's <int:...> URL converter accepts arbitrarily large integers (Python ints
+    # are unbounded), but SQLite's INTEGER column is a 64-bit value, so binding an
+    # out-of-range id (e.g. a 20-digit doc_id in a URL) raises OverflowError deep in
+    # sqlite3. Handle it as a clean 400 everywhere instead of a raw 500.
+    if request.path.startswith("/api") or request.path in ("/upload", "/verify"):
+        return jsonify({"error": "invalid_id", "message": "The provided ID is out of range."}), 400
+    return "Invalid ID.", 400
+
+
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
     # Catch-all: never let a raw traceback / HTML 500 page reach the browser.
@@ -4079,9 +5197,29 @@ def handle_unexpected_error(e):
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "21006"))
+    try:
+        port = int(os.getenv("PORT", "21006"))
+    except ValueError:
+        port = 21006
+    port = max(1, min(65535, port))
+    # 0.0.0.0 lets a phone/tablet on the same Wi-Fi open the dashboard using
+    # the laptop's LAN IP. For an internet deployment, use a real HTTPS
+    # reverse proxy/cloud host and set HOST/SESSION_COOKIE_SECURE accordingly.
+    host = os.getenv("HOST", "0.0.0.0")
+    lan_ip = "127.0.0.1"
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        lan_ip = probe.getsockname()[0]
+        probe.close()
+    except OSError:
+        pass
     print("=" * 70)
     print(f"SECURE DIGITAL EVIDENCE MANAGEMENT SYSTEM READY (PORT {port})")
-    print(f"Open in your browser: http://127.0.0.1:{port}")
+    print(f"Laptop:  http://127.0.0.1:{port}")
+    print(f"Phone:   http://{lan_ip}:{port}  (same Wi-Fi/LAN)")
+    print("Health:  /healthz")
+    print("Tip:    Open /dashboard after login. The dashboard is responsive for laptop + phone browsers.")
+    print("For internet access: deploy behind HTTPS/reverse proxy; do not expose the Flask dev server directly.")
     print("=" * 70)
-    app.run(host="127.0.0.1", port=port, debug=False)
+    app.run(host=host, port=port, debug=False, threaded=True)
