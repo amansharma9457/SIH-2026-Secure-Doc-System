@@ -52,4 +52,3 @@ The blockchain ledger in this project is a local SHA-256 hash-chain used to make
 License
 Add a license of your choice (MIT/Apache-2.0 are common for hackathon submissions) before making the repo public.
 
-
